@@ -12,6 +12,7 @@ use std::ptr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+
 use super::format::{AudioFormat, OutputLayout};
 use super::ring_buffer::RingBuffer;
 use super::stats::PlaybackStats;
@@ -27,6 +28,7 @@ type AudioUnit = *mut c_void;
 type AudioComponentInstance = AudioUnit;
 
 const K_AUDIO_OBJECT_SYSTEM_OBJECT: AudioObjectID = 1;
+const K_AUDIO_HARDWARE_PROPERTY_DEVICES: AudioObjectPropertySelector = 0x64657623; // 'dev#'
 const K_AUDIO_HARDWARE_PROPERTY_DEFAULT_OUTPUT_DEVICE: AudioObjectPropertySelector = 0x644F7574; // 'dOut'
 const K_AUDIO_DEVICE_PROPERTY_NOMINAL_SAMPLE_RATE: AudioObjectPropertySelector = 0x6E737274; // 'nsrt'
 const K_AUDIO_DEVICE_PROPERTY_AVAILABLE_NOMINAL_SAMPLE_RATES: AudioObjectPropertySelector =
@@ -34,7 +36,14 @@ const K_AUDIO_DEVICE_PROPERTY_AVAILABLE_NOMINAL_SAMPLE_RATES: AudioObjectPropert
 const K_AUDIO_DEVICE_PROPERTY_BUFFER_FRAME_SIZE: AudioObjectPropertySelector = 0x6673697A; // 'fsiz'
 const K_AUDIO_DEVICE_PROPERTY_HOG_MODE: AudioObjectPropertySelector = 0x6F696E6B; // 'oink'
 const K_AUDIO_DEVICE_PROPERTY_STREAMS: AudioObjectPropertySelector = 0x73746D23; // 'stm#'
+const K_AUDIO_DEVICE_PROPERTY_STREAM_CONFIGURATION: AudioObjectPropertySelector = 0x736C6179; // 'slay'
 const K_AUDIO_STREAM_PROPERTY_PHYSICAL_FORMAT: AudioObjectPropertySelector = 0x70667420; // 'pft '
+const K_AUDIO_DEVICE_PROPERTY_TRANSPORT_TYPE: AudioObjectPropertySelector = 0x7472616E; // 'tran'
+const K_AUDIO_OBJECT_PROPERTY_NAME: AudioObjectPropertySelector = 0x6E616D65; // 'name'
+
+// 设备传输类型
+const K_AUDIO_DEVICE_TRANSPORT_TYPE_BLUETOOTH: u32 = 0x626C7565; // 'blue'
+const K_AUDIO_DEVICE_TRANSPORT_TYPE_BLUETOOTH_LE: u32 = 0x62746C65; // 'btle'
 
 const K_AUDIO_OBJECT_PROPERTY_SCOPE_OUTPUT: AudioObjectPropertyScope = 0x6F757470; // 'outp'
 const K_AUDIO_OBJECT_PROPERTY_SCOPE_GLOBAL: AudioObjectPropertyScope = 0x676C6F62; // 'glob'
@@ -244,6 +253,7 @@ extern "C" {
     ) -> OSStatus;
 }
 
+
 /// 音频输出设备信息
 #[derive(Debug, Clone)]
 pub struct DeviceInfo {
@@ -251,6 +261,7 @@ pub struct DeviceInfo {
     pub name: String,
     pub supported_sample_rates: Vec<f64>,
     pub current_sample_rate: f64,
+    pub is_bluetooth: bool,
 }
 
 /// 输出配置
@@ -264,6 +275,12 @@ pub struct OutputConfig {
     pub exclusive_mode: bool,
     /// 是否尝试整数模式
     pub integer_mode: bool,
+    /// 是否使用 HALOutput（直接硬件访问）
+    /// 设为 false 时强制使用 DefaultOutput（通过系统混音器）
+    /// 蓝牙设备建议设为 false
+    pub use_hal: bool,
+    /// 指定输出设备 ID（None 表示使用系统默认设备）
+    pub device_id: Option<u32>,
 }
 
 impl Default for OutputConfig {
@@ -273,6 +290,8 @@ impl Default for OutputConfig {
             buffer_frames: 512,
             exclusive_mode: true,
             integer_mode: true,
+            use_hal: true, // 默认使用 HALOutput（有线设备最佳）
+            device_id: None, // 默认使用系统默认设备
         }
     }
 }
@@ -540,6 +559,8 @@ pub struct AudioOutput {
     actual_format: AudioFormat,
     /// 设备支持的采样率列表
     supported_sample_rates: Vec<f64>,
+    /// 是否使用 HALOutput（直接硬件访问）
+    is_hal_output: bool,
 }
 
 impl AudioOutput {
@@ -566,28 +587,227 @@ impl AudioOutput {
         };
 
         if status != NO_ERR {
-            eprintln!("[DEBUG] Failed to get default device ID, status: {}", status);
             return Err(OutputError::GetPropertyFailed(status));
         }
-
-        eprintln!("[DEBUG] Got default device ID: {}", device_id);
 
         if device_id == 0 {
             return Err(OutputError::NoDefaultDevice);
         }
 
         let sample_rates = Self::get_supported_sample_rates(device_id)?;
-        eprintln!("[DEBUG] Supported sample rates: {:?}", sample_rates);
-
         let current_rate = Self::get_current_sample_rate(device_id)?;
-        eprintln!("[DEBUG] Current sample rate: {}", current_rate);
+        let device_name = Self::get_device_name(device_id);
+        let is_bluetooth = Self::is_bluetooth_device(device_id);
+
+        log::info!("Default device: {} (ID: {})", device_name, device_id);
+        log::info!("Device type: {}", if is_bluetooth { "Bluetooth" } else { "Wired/USB" });
+        log::info!("Supported sample rates: {:?}", sample_rates);
+        log::info!("Current sample rate: {} Hz", current_rate);
 
         Ok(DeviceInfo {
             id: device_id,
-            name: "Default Output".to_string(),
+            name: device_name,
             supported_sample_rates: sample_rates,
             current_sample_rate: current_rate,
+            is_bluetooth,
         })
+    }
+
+    /// 获取所有输出设备
+    pub fn get_all_output_devices() -> Result<Vec<DeviceInfo>, OutputError> {
+        // 获取设备列表大小
+        let address = AudioObjectPropertyAddress {
+            selector: K_AUDIO_HARDWARE_PROPERTY_DEVICES,
+            scope: K_AUDIO_OBJECT_PROPERTY_SCOPE_GLOBAL,
+            element: K_AUDIO_OBJECT_PROPERTY_ELEMENT_MAIN,
+        };
+
+        let mut size: u32 = 0;
+        let status = unsafe {
+            AudioObjectGetPropertyDataSize(
+                K_AUDIO_OBJECT_SYSTEM_OBJECT,
+                &address,
+                0,
+                ptr::null(),
+                &mut size,
+            )
+        };
+
+        if status != NO_ERR {
+            return Err(OutputError::GetPropertyFailed(status));
+        }
+
+        let device_count = size as usize / std::mem::size_of::<AudioDeviceID>();
+        if device_count == 0 {
+            return Ok(vec![]);
+        }
+
+        // 获取所有设备 ID
+        let mut device_ids = vec![0u32; device_count];
+        let status = unsafe {
+            AudioObjectGetPropertyData(
+                K_AUDIO_OBJECT_SYSTEM_OBJECT,
+                &address,
+                0,
+                ptr::null(),
+                &mut size,
+                device_ids.as_mut_ptr() as *mut c_void,
+            )
+        };
+
+        if status != NO_ERR {
+            return Err(OutputError::GetPropertyFailed(status));
+        }
+
+        // 过滤出有输出通道的设备
+        let mut output_devices = Vec::new();
+        for device_id in device_ids {
+            if Self::has_output_channels(device_id) {
+                if let Ok(info) = Self::get_device_info(device_id) {
+                    output_devices.push(info);
+                }
+            }
+        }
+
+        Ok(output_devices)
+    }
+
+    /// 根据设备 ID 获取设备信息
+    pub fn get_device_info(device_id: AudioDeviceID) -> Result<DeviceInfo, OutputError> {
+        let device_name = Self::get_device_name(device_id);
+
+        // 获取采样率（某些设备可能不支持）
+        let sample_rates = Self::get_supported_sample_rates(device_id)
+            .unwrap_or_else(|_| vec![44100.0, 48000.0]);
+        let current_rate = Self::get_current_sample_rate(device_id)
+            .unwrap_or(48000.0);
+        let is_bluetooth = Self::is_bluetooth_device(device_id);
+
+        Ok(DeviceInfo {
+            id: device_id,
+            name: device_name,
+            supported_sample_rates: sample_rates,
+            current_sample_rate: current_rate,
+            is_bluetooth,
+        })
+    }
+
+    /// 按名称查找设备（支持部分匹配）
+    pub fn find_device_by_name(name: &str) -> Option<DeviceInfo> {
+        let devices = Self::get_all_output_devices().ok()?;
+        let name_lower = name.to_lowercase();
+
+        // 先尝试精确匹配
+        for device in &devices {
+            if device.name.to_lowercase() == name_lower {
+                return Some(device.clone());
+            }
+        }
+
+        // 再尝试部分匹配
+        for device in &devices {
+            if device.name.to_lowercase().contains(&name_lower) {
+                return Some(device.clone());
+            }
+        }
+
+        None
+    }
+
+    /// 检查设备是否有输出通道
+    fn has_output_channels(device_id: AudioDeviceID) -> bool {
+        // 使用 kAudioDevicePropertyStreams 检查是否有输出流
+        let address = AudioObjectPropertyAddress {
+            selector: K_AUDIO_DEVICE_PROPERTY_STREAMS,
+            scope: K_AUDIO_OBJECT_PROPERTY_SCOPE_OUTPUT,
+            element: K_AUDIO_OBJECT_PROPERTY_ELEMENT_MAIN,
+        };
+
+        let mut size: u32 = 0;
+        let status = unsafe {
+            AudioObjectGetPropertyDataSize(device_id, &address, 0, ptr::null(), &mut size)
+        };
+
+        // 如果有输出流，size > 0
+        status == NO_ERR && size > 0
+    }
+
+    /// 检测设备是否是蓝牙设备
+    fn is_bluetooth_device(device_id: AudioDeviceID) -> bool {
+        let address = AudioObjectPropertyAddress {
+            selector: K_AUDIO_DEVICE_PROPERTY_TRANSPORT_TYPE,
+            scope: K_AUDIO_OBJECT_PROPERTY_SCOPE_GLOBAL,
+            element: K_AUDIO_OBJECT_PROPERTY_ELEMENT_MAIN,
+        };
+
+        let mut transport_type: u32 = 0;
+        let mut size = std::mem::size_of::<u32>() as u32;
+
+        let status = unsafe {
+            AudioObjectGetPropertyData(
+                device_id,
+                &address,
+                0,
+                ptr::null(),
+                &mut size,
+                &mut transport_type as *mut _ as *mut c_void,
+            )
+        };
+
+        if status != NO_ERR {
+            return false;
+        }
+
+        transport_type == K_AUDIO_DEVICE_TRANSPORT_TYPE_BLUETOOTH
+            || transport_type == K_AUDIO_DEVICE_TRANSPORT_TYPE_BLUETOOTH_LE
+    }
+
+    /// 获取设备名称
+    fn get_device_name(device_id: AudioDeviceID) -> String {
+        // 使用 coreaudio_sys 的 CFString API
+        use coreaudio_sys::{
+            AudioObjectGetPropertyData as sysGetPropertyData,
+            kAudioObjectPropertyName,
+            kAudioObjectPropertyScopeGlobal,
+            kAudioObjectPropertyElementMain,
+            AudioObjectPropertyAddress as SysPropertyAddress,
+        };
+
+        let address = SysPropertyAddress {
+            mSelector: kAudioObjectPropertyName,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain,
+        };
+
+        // 获取属性大小（应该是一个 CFStringRef）
+        let mut size: u32 = std::mem::size_of::<*const c_void>() as u32;
+        let mut cf_string_ref: *const c_void = ptr::null();
+
+        let status = unsafe {
+            sysGetPropertyData(
+                device_id,
+                &address,
+                0,
+                ptr::null(),
+                &mut size,
+                &mut cf_string_ref as *mut _ as *mut c_void,
+            )
+        };
+
+        if status != 0 || cf_string_ref.is_null() {
+            return format!("Device {}", device_id);
+        }
+
+        // 使用 core-foundation crate 安全处理 CFString
+        use core_foundation::base::TCFType;
+        use core_foundation::string::CFString;
+
+        let cf_string = unsafe {
+            // wrap_under_create_rule 表示我们拥有这个引用（需要 release）
+            CFString::wrap_under_create_rule(cf_string_ref as *const _)
+        };
+
+        cf_string.to_string()
     }
 
     /// 获取设备支持的采样率
@@ -754,8 +974,8 @@ impl AudioOutput {
                     if rate <= requested + 1.0 {
                         for &supported_rate in supported {
                             if (supported_rate - rate).abs() < 1.0 {
-                                eprintln!(
-                                    "[DEBUG] Sample rate fallback: {} → {} Hz (integer division)",
+                                log::info!(
+                                    "Sample rate fallback: {} → {} Hz (integer division)",
                                     requested, supported_rate
                                 );
                                 return supported_rate;
@@ -782,10 +1002,12 @@ impl AudioOutput {
             }
         }
 
-        eprintln!(
-            "[DEBUG] Sample rate fallback: {} → {} Hz (nearest)",
-            requested, best
-        );
+        if (best - requested).abs() > 1.0 {
+            log::info!(
+                "Sample rate fallback: {} → {} Hz (nearest)",
+                requested, best
+            );
+        }
         best
     }
 
@@ -875,16 +1097,9 @@ impl AudioOutput {
 
             if let Ok(actual_rate) = Self::get_current_sample_rate(device_id) {
                 if (actual_rate - rate).abs() < TOLERANCE {
-                    eprintln!(
-                        "[DEBUG] Sample rate verified: {} Hz (attempt {})",
-                        actual_rate, attempt + 1
-                    );
+                    log::info!("Sample rate verified: {} Hz (attempt {})", actual_rate, attempt + 1);
                     return Ok(());
                 }
-                eprintln!(
-                    "[DEBUG] Sample rate mismatch: requested {} Hz, got {} Hz (attempt {})",
-                    rate, actual_rate, attempt + 1
-                );
             }
         }
 
@@ -1012,6 +1227,15 @@ impl AudioOutput {
     /// 优先使用 HALOutput 绕过系统混音器，直接访问设备
     /// 如果失败则回退到 DefaultOutput
     pub fn new(config: OutputConfig) -> Result<Self, OutputError> {
+        // 获取目标设备（指定的或默认的）
+        let target_device = if let Some(device_id) = config.device_id {
+            Self::get_device_info(device_id)?
+        } else {
+            Self::get_default_device()?
+        };
+
+        log::info!("Target device: {} (ID: {})", target_device.name, target_device.id);
+
         // 首先尝试 HALOutput（绕过混音器，更低延迟，更干净的信号路径）
         let desc_hal = AudioComponentDescription {
             component_type: K_AUDIO_UNIT_TYPE_OUTPUT,
@@ -1021,19 +1245,30 @@ impl AudioOutput {
             component_flags_mask: 0,
         };
 
-        let component_hal = unsafe { AudioComponentFindNext(ptr::null_mut(), &desc_hal) };
-        if !component_hal.is_null() {
-            eprintln!("[DEBUG] Found HALOutput component, using direct device access");
-            match Self::new_hal_output(component_hal, config.clone()) {
-                Ok(output) => return Ok(output),
-                Err(e) => {
-                    eprintln!("[DEBUG] HALOutput failed: {:?}, falling back to DefaultOutput", e);
+        // 检测目标设备是否是蓝牙
+        let is_bluetooth = target_device.is_bluetooth;
+        if is_bluetooth {
+            log::info!("Detected Bluetooth device, using system mixer");
+        }
+
+        // 根据配置选择输出模式（蓝牙设备自动使用系统混音器）
+        if config.use_hal && !is_bluetooth {
+            let component_hal = unsafe { AudioComponentFindNext(ptr::null_mut(), &desc_hal) };
+            if !component_hal.is_null() {
+                log::info!("Found HALOutput component, using direct device access");
+                match Self::new_hal_output(component_hal, config.clone(), &target_device) {
+                    Ok(output) => return Ok(output),
+                    Err(e) => {
+                        log::info!("HALOutput failed: {:?}, falling back to DefaultOutput", e);
+                    }
                 }
             }
+        } else if !config.use_hal {
+            log::info!("HALOutput disabled by config, using system mixer");
         }
 
         // 回退到 DefaultOutput（通过系统混音器）
-        eprintln!("[DEBUG] Using DefaultOutput (via system mixer)");
+        log::info!("Using DefaultOutput (via system mixer)");
         let desc = AudioComponentDescription {
             component_type: K_AUDIO_UNIT_TYPE_OUTPUT,
             component_sub_type: K_AUDIO_UNIT_SUB_TYPE_DEFAULT_OUTPUT,
@@ -1051,16 +1286,14 @@ impl AudioOutput {
     }
 
     /// 使用 HALOutput 创建输出（绕过系统混音器）
-    fn new_hal_output(component: AudioComponent, config: OutputConfig) -> Result<Self, OutputError> {
+    fn new_hal_output(component: AudioComponent, config: OutputConfig, device: &DeviceInfo) -> Result<Self, OutputError> {
         let mut audio_unit: AudioUnit = ptr::null_mut();
         let status = unsafe { AudioComponentInstanceNew(component, &mut audio_unit) };
         if status != NO_ERR {
             return Err(OutputError::AudioUnitFailed(status));
         }
 
-        // 获取默认输出设备
-        let device = Self::get_default_device()?;
-        eprintln!("[DEBUG] HALOutput: using device {} ({}Hz)", device.id, device.current_sample_rate);
+        log::info!("HALOutput: using device {} (ID: {}, {}Hz)", device.name, device.id, device.current_sample_rate);
 
         // 设置输出设备
         let status = unsafe {
@@ -1074,7 +1307,6 @@ impl AudioOutput {
             )
         };
         if status != NO_ERR {
-            eprintln!("[DEBUG] Failed to set HALOutput device (status: {})", status);
             unsafe { AudioComponentInstanceDispose(audio_unit) };
             return Err(OutputError::AudioUnitFailed(status));
         }
@@ -1087,7 +1319,8 @@ impl AudioOutput {
             original_sample_rate: device.current_sample_rate,
             hog_mode_acquired: false,
             actual_format: AudioFormat::new(48000, 2, 32),
-            supported_sample_rates: device.supported_sample_rates,
+            supported_sample_rates: device.supported_sample_rates.clone(),
+            is_hal_output: true,
         })
     }
 
@@ -1100,8 +1333,6 @@ impl AudioOutput {
         }
 
         // DefaultOutput 不需要手动设置设备
-        eprintln!("[DEBUG] DefaultOutput: using system default device");
-
         Ok(Self {
             device_id: 0,  // DefaultOutput 不使用具体设备 ID
             audio_unit,
@@ -1111,6 +1342,7 @@ impl AudioOutput {
             hog_mode_acquired: false,
             actual_format: AudioFormat::new(48000, 2, 32),
             supported_sample_rates: vec![44100.0, 48000.0],  // DefaultOutput 常见支持率
+            is_hal_output: false,
         })
     }
 
@@ -1238,12 +1470,12 @@ impl AudioOutput {
     fn try_set_physical_format(&self, format: &AudioFormat) -> Option<(AudioStreamBasicDescription, OutputFormatMode)> {
         // 获取输出流 ID
         let stream_id = Self::get_output_stream_id(self.device_id)?;
-        eprintln!("[DEBUG] Output stream ID: {}", stream_id);
+        log::info!("Output stream ID: {}", stream_id);
 
         // 获取当前物理格式
         if let Some(current) = Self::get_physical_format(stream_id) {
-            eprintln!(
-                "[DEBUG] Current physical format: {}Hz, {} channels, {} bits, flags=0x{:x}",
+            log::info!(
+                "Current physical format: {}Hz, {} channels, {} bits, flags=0x{:x}",
                 current.sample_rate,
                 current.channels_per_frame,
                 current.bits_per_channel,
@@ -1270,7 +1502,7 @@ impl AudioOutput {
                 if actual.bits_per_channel == 32
                     && (actual.format_flags & K_AUDIO_FORMAT_FLAG_IS_SIGNED_INTEGER) != 0
                 {
-                    eprintln!("[DEBUG] Physical format set to Int32 (direct hardware path)");
+                    log::info!("Physical format set to Int32 (direct hardware path)");
                     return Some((actual, OutputFormatMode::Int32));
                 }
             }
@@ -1292,13 +1524,13 @@ impl AudioOutput {
         if Self::set_physical_format(stream_id, &asbd_int24) {
             if let Some(actual) = Self::get_physical_format(stream_id) {
                 if actual.bits_per_channel == 24 {
-                    eprintln!("[DEBUG] Physical format set to Int24 (direct hardware path)");
+                    log::info!("Physical format set to Int24 (direct hardware path)");
                     return Some((actual, OutputFormatMode::Int24));
                 }
             }
         }
 
-        eprintln!("[DEBUG] Physical format setting failed, using ASBD format");
+        log::info!("Physical format setting failed, using ASBD format");
         None
     }
 
@@ -1332,11 +1564,9 @@ impl AudioOutput {
         };
 
         if status == NO_ERR {
-            eprintln!("[DEBUG] Integer 32-bit output mode enabled (bit-perfect path)");
+            log::info!("Integer 32-bit output mode enabled (bit-perfect path)");
             return (true, OutputFormatMode::Int32);
         }
-
-        eprintln!("[DEBUG] Int32 format not supported (status: {}), trying Int24", status);
 
         // 尝试 24-bit Integer (packed)
         let asbd_int24 = AudioStreamBasicDescription {
@@ -1363,11 +1593,11 @@ impl AudioOutput {
         };
 
         if status == NO_ERR {
-            eprintln!("[DEBUG] Integer 24-bit output mode enabled");
+            log::info!("Integer 24-bit output mode enabled");
             return (true, OutputFormatMode::Int24);
         }
 
-        eprintln!("[DEBUG] Integer formats not supported, using Float32");
+        log::info!("Integer formats not supported, using Float32");
         (false, OutputFormatMode::Float32)
     }
 
@@ -1378,6 +1608,13 @@ impl AudioOutput {
         ring_buffer: Arc<RingBuffer<i32>>,
         stats: Arc<PlaybackStats>,
     ) -> Result<(), OutputError> {
+        // 显示输出模式
+        if self.is_hal_output {
+            log::info!("Output mode: HALOutput (direct hardware access, bit-perfect)");
+        } else {
+            log::info!("Output mode: DefaultOutput (via system mixer)");
+        }
+
         // 如果有有效的 device_id，尝试设备相关操作
         if self.device_id != 0 {
             // 尝试独占模式
@@ -1413,11 +1650,8 @@ impl AudioOutput {
                     std::mem::size_of::<AudioDeviceID>() as u32,
                 )
             };
-            if status != NO_ERR {
-                eprintln!("[DEBUG] Failed to set output device (status: {}), continuing anyway", status);
-            }
-        } else {
-            eprintln!("[DEBUG] Using DefaultOutput unit, skipping device configuration");
+            // Ignore error - will use DefaultOutput
+            let _ = status;
         }
 
         // 启用输出（DefaultOutput 可能不支持此属性，忽略错误）
@@ -1432,16 +1666,14 @@ impl AudioOutput {
                 std::mem::size_of::<u32>() as u32,
             )
         };
-        if status != NO_ERR {
-            eprintln!("[DEBUG] EnableIO not supported (status: {}), continuing anyway", status);
-        }
+        // EnableIO may not be supported on all devices
+        let _ = status;
 
         // 尝试设置流格式
         // 优先级：Physical Format (直接硬件) > ASBD Integer > Float32
         let output_mode = if self.config.integer_mode && self.device_id != 0 {
             // 首先尝试物理格式（最直接的硬件访问路径）
             if let Some((_, mode)) = self.try_set_physical_format(&format) {
-                eprintln!("[DEBUG] Using physical format (direct hardware path)");
                 mode
             } else {
                 // 回退到 ASBD 格式
@@ -1472,15 +1704,12 @@ impl AudioOutput {
                             std::mem::size_of::<AudioStreamBasicDescription>() as u32,
                         )
                     };
-                    if status != NO_ERR {
-                        eprintln!("[DEBUG] Failed to set Float32 format (status: {})", status);
-                    }
+                    let _ = status;
                     OutputFormatMode::Float32
                 }
             }
         } else {
             // DefaultOutput 使用 Float32
-            eprintln!("[DEBUG] Setting stream format: {}Hz, {} channels, Float32", format.sample_rate, format.channels);
             let asbd = AudioStreamBasicDescription {
                 sample_rate: format.sample_rate as f64,
                 format_id: K_AUDIO_FORMAT_LINEAR_PCM,
@@ -1503,9 +1732,7 @@ impl AudioOutput {
                     std::mem::size_of::<AudioStreamBasicDescription>() as u32,
                 )
             };
-            if status != NO_ERR {
-                eprintln!("[DEBUG] Failed to set Float32 format (status: {})", status);
-            }
+            let _ = status;
             OutputFormatMode::Float32
         };
 
@@ -1517,7 +1744,7 @@ impl AudioOutput {
         };
         // 使用更大的缓冲区以处理可变的 callback 大小
         let max_samples_per_callback = buffer_frames.max(8192) as usize * format.channels as usize;
-        eprintln!("[DEBUG] Buffer frames: {}, max samples: {}", buffer_frames, max_samples_per_callback);
+        log::info!("Buffer frames: {}, max samples: {}", buffer_frames, max_samples_per_callback);
 
         // 查询输出布局
         let output_layout = self.query_output_layout()?;
@@ -1555,7 +1782,7 @@ impl AudioOutput {
         // 锁定关键内存，防止 page fault
         ring_buffer.lock_memory();
         context.lock_memory();
-        eprintln!("[DEBUG] Memory locked for realtime safety");
+        log::info!("Memory locked for realtime safety");
 
         let context_ptr = Box::into_raw(context);
 

@@ -41,6 +41,14 @@ struct Cli {
     #[arg(long)]
     no_exclusive: bool,
 
+    /// Use system mixer instead of direct hardware access (recommended for Bluetooth)
+    #[arg(long)]
+    no_hal: bool,
+
+    /// Select output device by name or ID (use 'info' command to list devices)
+    #[arg(short, long)]
+    device: Option<String>,
+
     /// Show verbose output
     #[arg(short, long)]
     verbose: bool,
@@ -95,7 +103,9 @@ fn main() -> anyhow::Result<()> {
                 println!("       hifi-replayer interactive <FILE>");
                 println!("\nOptions:");
                 println!("  -b, --buffer-ms <MS>   Buffer size in milliseconds [default: 2000]");
+                println!("  -d, --device <ID|NAME> Select output device (use 'info' to list)");
                 println!("  --no-exclusive         Disable exclusive mode");
+                println!("  --no-hal               Use system mixer (recommended for Bluetooth)");
                 println!("  -v, --verbose          Show verbose output");
                 println!("\nPress Ctrl+C to stop playback");
             }
@@ -107,22 +117,24 @@ fn main() -> anyhow::Result<()> {
 
 /// 显示设备信息
 fn show_device_info() -> anyhow::Result<()> {
-    println!("=== Audio Device Information ===\n");
+    println!("=== Audio Output Devices ===\n");
 
-    let device = AudioOutput::get_default_device()?;
+    let default_device = AudioOutput::get_default_device()?;
+    let all_devices = AudioOutput::get_all_output_devices()?;
 
-    println!("Default Output Device:");
-    println!("  ID: {}", device.id);
-    println!("  Current Sample Rate: {} Hz", device.current_sample_rate);
-    println!("\nSupported Sample Rates:");
-    for rate in &device.supported_sample_rates {
-        let mark = if (*rate - device.current_sample_rate).abs() < 1.0 {
-            " (current)"
-        } else {
-            ""
-        };
-        println!("  {} Hz{}", rate, mark);
+    for device in &all_devices {
+        let is_default = device.id == default_device.id;
+        let default_mark = if is_default { " *" } else { "" };
+        let type_str = if device.is_bluetooth { "BT" } else { "USB" };
+
+        println!("[{:>3}] {} ({}){}", device.id, device.name, type_str, default_mark);
     }
+
+    println!();
+    println!("* = system default");
+    println!("BT = Bluetooth (auto system mixer), USB = Wired/USB\n");
+    println!("Select device: hifi-replayer -d <ID> <file>");
+    println!("Example: hifi-replayer -d {} <file>", default_device.id);
 
     Ok(())
 }
@@ -251,12 +263,32 @@ fn interactive_play(file: &PathBuf, cli: &Cli) -> anyhow::Result<()> {
 fn create_engine_config(cli: &Cli) -> EngineConfig {
     let buffer_frames = (cli.buffer_ms as usize * 48) + 1000; // 近似，实际会根据采样率调整
 
+    // 解析设备选择
+    let device_id = cli.device.as_ref().and_then(|d| {
+        // 先尝试解析为设备 ID
+        if let Ok(id) = d.parse::<u32>() {
+            println!("Using device ID: {}", id);
+            return Some(id);
+        }
+
+        // 否则按名称查找
+        if let Some(device) = AudioOutput::find_device_by_name(d) {
+            println!("Found device: {} (ID: {})", device.name, device.id);
+            return Some(device.id);
+        }
+
+        eprintln!("Warning: Device '{}' not found, using system default", d);
+        None
+    });
+
     EngineConfig {
         output: crate::audio::OutputConfig {
             sample_rate: 48000, // 会被文件采样率覆盖
             buffer_frames: 512,
             exclusive_mode: !cli.no_exclusive,
             integer_mode: true,
+            use_hal: !cli.no_hal,
+            device_id,
         },
         buffer_frames,
         prebuffer_ratio: 0.5,
