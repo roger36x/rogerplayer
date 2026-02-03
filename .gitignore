@@ -1,0 +1,24 @@
+# Rust
+/target/
+Cargo.lock
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+
+# Logs
+*.log
+
+# Test audio files
+*.flac
+*.wav
+*.aiff
+*.mp3
+*.m4a
+*.aac

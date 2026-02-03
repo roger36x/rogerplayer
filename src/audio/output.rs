@@ -1,0 +1,1870 @@
+//! Core Audio AUHAL 输出
+//!
+//! 使用 AudioUnit HAL (AUHAL) 实现音频输出
+//! 支持：
+//! - 独占模式 (Hog Mode)
+//! - 整数模式 (避免浮点转换)
+//! - 动态采样率切换
+//! - Interleaved/NonInterleaved 输出布局
+
+use std::ffi::c_void;
+use std::ptr;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
+use super::format::{AudioFormat, OutputLayout};
+use super::ring_buffer::RingBuffer;
+use super::stats::PlaybackStats;
+
+/// Core Audio 类型定义
+type AudioDeviceID = u32;
+type AudioObjectID = u32;
+type AudioObjectPropertySelector = u32;
+type AudioObjectPropertyScope = u32;
+type AudioObjectPropertyElement = u32;
+type OSStatus = i32;
+type AudioUnit = *mut c_void;
+type AudioComponentInstance = AudioUnit;
+
+const K_AUDIO_OBJECT_SYSTEM_OBJECT: AudioObjectID = 1;
+const K_AUDIO_HARDWARE_PROPERTY_DEFAULT_OUTPUT_DEVICE: AudioObjectPropertySelector = 0x644F7574; // 'dOut'
+const K_AUDIO_DEVICE_PROPERTY_NOMINAL_SAMPLE_RATE: AudioObjectPropertySelector = 0x6E737274; // 'nsrt'
+const K_AUDIO_DEVICE_PROPERTY_AVAILABLE_NOMINAL_SAMPLE_RATES: AudioObjectPropertySelector =
+    0x6E737223; // 'nsr#'
+const K_AUDIO_DEVICE_PROPERTY_BUFFER_FRAME_SIZE: AudioObjectPropertySelector = 0x6673697A; // 'fsiz'
+const K_AUDIO_DEVICE_PROPERTY_HOG_MODE: AudioObjectPropertySelector = 0x6F696E6B; // 'oink'
+const K_AUDIO_DEVICE_PROPERTY_STREAMS: AudioObjectPropertySelector = 0x73746D23; // 'stm#'
+const K_AUDIO_STREAM_PROPERTY_PHYSICAL_FORMAT: AudioObjectPropertySelector = 0x70667420; // 'pft '
+
+const K_AUDIO_OBJECT_PROPERTY_SCOPE_OUTPUT: AudioObjectPropertyScope = 0x6F757470; // 'outp'
+const K_AUDIO_OBJECT_PROPERTY_SCOPE_GLOBAL: AudioObjectPropertyScope = 0x676C6F62; // 'glob'
+const K_AUDIO_OBJECT_PROPERTY_ELEMENT_MAIN: AudioObjectPropertyElement = 0;
+
+const K_AUDIO_FORMAT_LINEAR_PCM: u32 = 0x6C70636D; // 'lpcm'
+const K_AUDIO_FORMAT_FLAG_IS_FLOAT: u32 = 1 << 0;
+const K_AUDIO_FORMAT_FLAG_IS_BIG_ENDIAN: u32 = 1 << 1;
+const K_AUDIO_FORMAT_FLAG_IS_SIGNED_INTEGER: u32 = 1 << 2;
+const K_AUDIO_FORMAT_FLAG_IS_PACKED: u32 = 1 << 3;
+const K_AUDIO_FORMAT_FLAG_IS_NON_INTERLEAVED: u32 = 1 << 5;
+
+const K_AUDIO_UNIT_SCOPE_INPUT: u32 = 1;
+const K_AUDIO_UNIT_SCOPE_OUTPUT: u32 = 2;
+const K_AUDIO_UNIT_SCOPE_GLOBAL: u32 = 0;
+
+const K_AUDIO_OUTPUT_UNIT_PROPERTY_CURRENT_DEVICE: u32 = 2000;
+const K_AUDIO_UNIT_PROPERTY_STREAM_FORMAT: u32 = 8;
+const K_AUDIO_UNIT_PROPERTY_SET_RENDER_CALLBACK: u32 = 23;
+const K_AUDIO_OUTPUT_UNIT_PROPERTY_ENABLE_IO: u32 = 2003;
+
+const K_AUDIO_UNIT_TYPE_OUTPUT: u32 = 0x61756F75; // 'auou'
+const K_AUDIO_UNIT_SUB_TYPE_HAL_OUTPUT: u32 = 0x6168616C; // 'ahal'
+const K_AUDIO_UNIT_SUB_TYPE_DEFAULT_OUTPUT: u32 = 0x64656620; // 'def '
+const K_AUDIO_UNIT_MANUFACTURER_APPLE: u32 = 0x6170706C; // 'appl'
+
+const NO_ERR: OSStatus = 0;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+struct AudioObjectPropertyAddress {
+    selector: AudioObjectPropertySelector,
+    scope: AudioObjectPropertyScope,
+    element: AudioObjectPropertyElement,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+struct AudioStreamBasicDescription {
+    sample_rate: f64,
+    format_id: u32,
+    format_flags: u32,
+    bytes_per_packet: u32,
+    frames_per_packet: u32,
+    bytes_per_frame: u32,
+    channels_per_frame: u32,
+    bits_per_channel: u32,
+    reserved: u32,
+}
+
+impl AudioStreamBasicDescription {
+    fn is_non_interleaved(&self) -> bool {
+        (self.format_flags & K_AUDIO_FORMAT_FLAG_IS_NON_INTERLEAVED) != 0
+    }
+}
+
+#[repr(C)]
+struct AudioValueRange {
+    minimum: f64,
+    maximum: f64,
+}
+
+#[repr(C)]
+struct AudioComponentDescription {
+    component_type: u32,
+    component_sub_type: u32,
+    component_manufacturer: u32,
+    component_flags: u32,
+    component_flags_mask: u32,
+}
+
+type AudioComponent = *mut c_void;
+
+#[repr(C)]
+struct AURenderCallbackStruct {
+    input_proc: RenderCallback,
+    input_proc_ref_con: *mut c_void,
+}
+
+type RenderCallback = extern "C" fn(
+    in_ref_con: *mut c_void,
+    io_action_flags: *mut u32,
+    in_time_stamp: *const AudioTimeStamp,
+    in_bus_number: u32,
+    in_number_frames: u32,
+    io_data: *mut AudioBufferList,
+) -> OSStatus;
+
+/// AudioTimeStamp flags
+const K_AUDIO_TIME_STAMP_SAMPLE_TIME_VALID: u32 = 1;
+const K_AUDIO_TIME_STAMP_HOST_TIME_VALID: u32 = 2;
+
+#[repr(C)]
+struct AudioTimeStamp {
+    sample_time: f64,
+    host_time: u64,
+    rate_scalar: f64,
+    word_clock_time: u64,
+    smpte_time: SMPTETime,
+    flags: u32,
+    reserved: u32,
+}
+
+impl AudioTimeStamp {
+    /// 获取有效的 host_time，如果无效返回 0
+    #[inline]
+    fn valid_host_time(&self) -> u64 {
+        if (self.flags & K_AUDIO_TIME_STAMP_HOST_TIME_VALID) != 0 {
+            self.host_time
+        } else {
+            0
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Default)]
+struct SMPTETime {
+    subframes: i16,
+    subframe_divisor: i16,
+    counter: u32,
+    smpte_type: u32,
+    flags: u32,
+    hours: i16,
+    minutes: i16,
+    seconds: i16,
+    frames: i16,
+}
+
+#[repr(C)]
+struct AudioBufferList {
+    number_buffers: u32,
+    buffers: [AudioBuffer; 2], // 支持最多 2 个 buffer（立体声非交织）
+}
+
+#[repr(C)]
+struct AudioBuffer {
+    number_channels: u32,
+    data_byte_size: u32,
+    data: *mut c_void,
+}
+
+#[link(name = "CoreAudio", kind = "framework")]
+extern "C" {
+    fn AudioObjectGetPropertyDataSize(
+        object_id: AudioObjectID,
+        address: *const AudioObjectPropertyAddress,
+        qualifier_data_size: u32,
+        qualifier_data: *const c_void,
+        out_data_size: *mut u32,
+    ) -> OSStatus;
+
+    fn AudioObjectGetPropertyData(
+        object_id: AudioObjectID,
+        address: *const AudioObjectPropertyAddress,
+        qualifier_data_size: u32,
+        qualifier_data: *const c_void,
+        io_data_size: *mut u32,
+        out_data: *mut c_void,
+    ) -> OSStatus;
+
+    fn AudioObjectSetPropertyData(
+        object_id: AudioObjectID,
+        address: *const AudioObjectPropertyAddress,
+        qualifier_data_size: u32,
+        qualifier_data: *const c_void,
+        data_size: u32,
+        data: *const c_void,
+    ) -> OSStatus;
+}
+
+#[link(name = "AudioToolbox", kind = "framework")]
+extern "C" {
+    fn AudioComponentFindNext(
+        component: AudioComponent,
+        desc: *const AudioComponentDescription,
+    ) -> AudioComponent;
+
+    fn AudioComponentInstanceNew(
+        component: AudioComponent,
+        out_instance: *mut AudioComponentInstance,
+    ) -> OSStatus;
+
+    fn AudioComponentInstanceDispose(instance: AudioComponentInstance) -> OSStatus;
+
+    fn AudioUnitInitialize(unit: AudioUnit) -> OSStatus;
+    fn AudioUnitUninitialize(unit: AudioUnit) -> OSStatus;
+    fn AudioOutputUnitStart(unit: AudioUnit) -> OSStatus;
+    fn AudioOutputUnitStop(unit: AudioUnit) -> OSStatus;
+
+    fn AudioUnitSetProperty(
+        unit: AudioUnit,
+        property_id: u32,
+        scope: u32,
+        element: u32,
+        data: *const c_void,
+        data_size: u32,
+    ) -> OSStatus;
+
+    fn AudioUnitGetProperty(
+        unit: AudioUnit,
+        property_id: u32,
+        scope: u32,
+        element: u32,
+        data: *mut c_void,
+        data_size: *mut u32,
+    ) -> OSStatus;
+}
+
+/// 音频输出设备信息
+#[derive(Debug, Clone)]
+pub struct DeviceInfo {
+    pub id: AudioDeviceID,
+    pub name: String,
+    pub supported_sample_rates: Vec<f64>,
+    pub current_sample_rate: f64,
+}
+
+/// 输出配置
+#[derive(Clone, Debug)]
+pub struct OutputConfig {
+    /// 目标采样率
+    pub sample_rate: u32,
+    /// 缓冲区帧数
+    pub buffer_frames: u32,
+    /// 是否尝试独占模式
+    pub exclusive_mode: bool,
+    /// 是否尝试整数模式
+    pub integer_mode: bool,
+}
+
+impl Default for OutputConfig {
+    fn default() -> Self {
+        Self {
+            sample_rate: 48000,
+            buffer_frames: 512,
+            exclusive_mode: true,
+            integer_mode: true,
+        }
+    }
+}
+
+/// 音频输出错误
+#[derive(Debug)]
+pub enum OutputError {
+    NoDefaultDevice,
+    GetPropertyFailed(OSStatus),
+    SetPropertyFailed(OSStatus),
+    AudioUnitFailed(OSStatus),
+    SampleRateNotSupported(u32),
+    InvalidState(&'static str),
+    NoAudioComponent,
+}
+
+impl std::fmt::Display for OutputError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoDefaultDevice => write!(f, "No default audio output device"),
+            Self::GetPropertyFailed(s) => write!(f, "Failed to get property: OSStatus {}", s),
+            Self::SetPropertyFailed(s) => write!(f, "Failed to set property: OSStatus {}", s),
+            Self::AudioUnitFailed(s) => write!(f, "AudioUnit error: OSStatus {}", s),
+            Self::SampleRateNotSupported(r) => write!(f, "Sample rate {} not supported", r),
+            Self::InvalidState(s) => write!(f, "Invalid state: {}", s),
+            Self::NoAudioComponent => write!(f, "No audio component found"),
+        }
+    }
+}
+
+impl std::error::Error for OutputError {}
+
+/// TPDF Dither 状态
+///
+/// 使用 xorshift32 PRNG，realtime-safe（无分配、无锁）
+/// TPDF = 两个均匀随机数相加，产生三角形概率分布
+pub struct DitherState {
+    /// xorshift32 状态
+    state: u32,
+}
+
+impl DitherState {
+    pub fn new(seed: u32) -> Self {
+        Self { state: if seed == 0 { 0xDEADBEEF } else { seed } }
+    }
+
+    /// 生成下一个随机 u32（xorshift32 算法）
+    #[inline(always)]
+    pub fn next_u32(&mut self) -> u32 {
+        let mut x = self.state;
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        self.state = x;
+        x
+    }
+
+    /// 生成 TPDF dither 值，范围约 [-1, 1]
+    ///
+    /// TPDF = rand1 + rand2 - 1.0，其中 rand1, rand2 ∈ [0, 1]
+    /// 结果是三角形分布，峰值在 0
+    #[inline(always)]
+    pub fn next_tpdf(&mut self) -> f32 {
+        // 生成两个 [0, 1) 范围的随机数
+        let r1 = (self.next_u32() >> 8) as f32 / 16777216.0; // 24-bit precision
+        let r2 = (self.next_u32() >> 8) as f32 / 16777216.0;
+        // TPDF: 范围 [-1, 1]，三角形分布
+        r1 + r2 - 1.0
+    }
+}
+
+/// 输出格式模式
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputFormatMode {
+    /// Float32 格式（通过系统混音器或 DefaultOutput）
+    Float32,
+    /// Int32 格式（直接整数输出，bit-perfect）
+    Int32,
+    /// Int24 格式（24-bit packed）
+    Int24,
+}
+
+/// Render 回调上下文
+///
+/// 所有字段在 callback 启动前预分配，callback 内不做任何分配
+/// 内存通过 mlock 锁定，防止 page fault
+pub struct CallbackContext {
+    pub ring_buffer: Arc<RingBuffer<i32>>,
+    pub stats: Arc<PlaybackStats>,
+    pub format: AudioFormat,
+    pub output_layout: OutputLayout,
+
+    /// 预分配的样本缓冲区（i32，保证对齐）
+    pub sample_buffer: Vec<i32>,
+
+    /// TPDF dither 状态
+    pub dither: DitherState,
+
+    /// 输出格式模式
+    pub output_mode: OutputFormatMode,
+
+    /// 源文件位深（用于判断是否需要 dither）
+    /// 当输出位深 >= 源位深时，无需 dither（bit-perfect）
+    pub source_bits: u16,
+
+    /// 是否正在运行
+    pub running: AtomicBool,
+
+    /// IO 线程是否已设置时间约束策略
+    pub thread_policy_set: AtomicBool,
+}
+
+/// Mach 线程策略相关类型和常量
+#[cfg(target_os = "macos")]
+mod thread_policy {
+    use std::ffi::c_void;
+
+    pub const THREAD_TIME_CONSTRAINT_POLICY: u32 = 2;
+    pub const THREAD_TIME_CONSTRAINT_POLICY_COUNT: u32 = 4;
+
+    #[repr(C)]
+    pub struct ThreadTimeConstraintPolicy {
+        pub period: u32,        // 周期（Mach ticks）
+        pub computation: u32,   // 计算时间（Mach ticks）
+        pub constraint: u32,    // 约束时间（Mach ticks）
+        pub preemptible: i32,   // 是否可抢占
+    }
+
+    #[link(name = "System")]
+    extern "C" {
+        pub fn mach_thread_self() -> u32;
+        pub fn thread_policy_set(
+            thread: u32,
+            flavor: u32,
+            policy_info: *const c_void,
+            count: u32,
+        ) -> i32;
+    }
+
+    #[repr(C)]
+    pub struct MachTimebaseInfo {
+        pub numer: u32,
+        pub denom: u32,
+    }
+
+    #[link(name = "System")]
+    extern "C" {
+        pub fn mach_timebase_info(info: *mut MachTimebaseInfo) -> i32;
+    }
+
+    /// 获取 Mach timebase 信息
+    pub fn get_timebase_info() -> (u32, u32) {
+        let mut info = MachTimebaseInfo { numer: 0, denom: 0 };
+        unsafe {
+            mach_timebase_info(&mut info);
+        }
+        (info.numer, info.denom)
+    }
+
+    /// 将纳秒转换为 Mach ticks
+    pub fn ns_to_ticks(ns: u64) -> u32 {
+        let (numer, denom) = get_timebase_info();
+        // ticks = ns * denom / numer
+        ((ns as u64 * denom as u64) / numer as u64) as u32
+    }
+}
+
+impl CallbackContext {
+    /// 设置 IO 线程的时间约束策略
+    ///
+    /// 使用 THREAD_TIME_CONSTRAINT_POLICY 为 CoreAudio IO 线程设置实时调度。
+    /// 这告诉调度器此线程有严格的实时需求。
+    ///
+    /// 参数基于音频缓冲区大小和采样率计算：
+    /// - period: 回调周期（通常是 buffer_frames / sample_rate 秒）
+    /// - computation: 预计计算时间（通常是周期的 50%）
+    /// - constraint: 必须完成的截止时间（通常等于周期）
+    #[cfg(target_os = "macos")]
+    pub fn set_realtime_thread_policy(&self) -> bool {
+        use thread_policy::*;
+
+        // 计算回调周期（纳秒）
+        // 假设 512 frames @ 48kHz = ~10.67ms
+        let buffer_frames = 512u64;
+        let sample_rate = self.format.sample_rate as u64;
+        let period_ns = buffer_frames * 1_000_000_000 / sample_rate;
+
+        // 转换为 Mach ticks
+        let period_ticks = ns_to_ticks(period_ns);
+        let computation_ticks = ns_to_ticks(period_ns / 2);  // 50% 计算时间
+        let constraint_ticks = period_ticks;
+
+        let policy = ThreadTimeConstraintPolicy {
+            period: period_ticks,
+            computation: computation_ticks,
+            constraint: constraint_ticks,
+            preemptible: 1,  // 允许抢占
+        };
+
+        let thread = unsafe { mach_thread_self() };
+        let result = unsafe {
+            thread_policy_set(
+                thread,
+                THREAD_TIME_CONSTRAINT_POLICY,
+                &policy as *const _ as *const std::ffi::c_void,
+                THREAD_TIME_CONSTRAINT_POLICY_COUNT,
+            )
+        };
+
+        if result == 0 {
+            // 使用 eprintln 而不是 log，因为在回调中不能使用 log
+            // 实际上这个函数只会在第一次回调时被调用一次
+            true
+        } else {
+            false
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub fn set_realtime_thread_policy(&self) -> bool {
+        false
+    }
+
+    /// 锁定上下文内存，防止 page fault
+    ///
+    /// 在实时音频回调中，page fault 会导致严重的时序问题。
+    /// 此函数锁定 CallbackContext 结构体和 sample_buffer 的内存。
+    pub fn lock_memory(&self) -> bool {
+        // 锁定 sample_buffer
+        let sample_ptr = self.sample_buffer.as_ptr() as *const libc::c_void;
+        let sample_len = self.sample_buffer.len() * std::mem::size_of::<i32>();
+
+        let result = unsafe { libc::mlock(sample_ptr, sample_len) };
+
+        if result == 0 {
+            log::debug!("CallbackContext sample_buffer locked: {} bytes", sample_len);
+            true
+        } else {
+            log::warn!(
+                "Failed to lock sample_buffer memory (errno: {})",
+                unsafe { *libc::__error() }
+            );
+            false
+        }
+    }
+
+    /// 解锁上下文内存
+    pub fn unlock_memory(&self) {
+        let sample_ptr = self.sample_buffer.as_ptr() as *const libc::c_void;
+        let sample_len = self.sample_buffer.len() * std::mem::size_of::<i32>();
+        unsafe {
+            libc::munlock(sample_ptr, sample_len);
+        }
+    }
+}
+
+/// Core Audio AUHAL 输出
+pub struct AudioOutput {
+    device_id: AudioDeviceID,
+    audio_unit: AudioUnit,
+    config: OutputConfig,
+    context: Option<Box<CallbackContext>>,
+    original_sample_rate: f64,
+    hog_mode_acquired: bool,
+    actual_format: AudioFormat,
+    /// 设备支持的采样率列表
+    supported_sample_rates: Vec<f64>,
+}
+
+impl AudioOutput {
+    /// 获取默认输出设备
+    pub fn get_default_device() -> Result<DeviceInfo, OutputError> {
+        let address = AudioObjectPropertyAddress {
+            selector: K_AUDIO_HARDWARE_PROPERTY_DEFAULT_OUTPUT_DEVICE,
+            scope: K_AUDIO_OBJECT_PROPERTY_SCOPE_GLOBAL,
+            element: K_AUDIO_OBJECT_PROPERTY_ELEMENT_MAIN,
+        };
+
+        let mut device_id: AudioDeviceID = 0;
+        let mut size = std::mem::size_of::<AudioDeviceID>() as u32;
+
+        let status = unsafe {
+            AudioObjectGetPropertyData(
+                K_AUDIO_OBJECT_SYSTEM_OBJECT,
+                &address,
+                0,
+                ptr::null(),
+                &mut size,
+                &mut device_id as *mut _ as *mut c_void,
+            )
+        };
+
+        if status != NO_ERR {
+            eprintln!("[DEBUG] Failed to get default device ID, status: {}", status);
+            return Err(OutputError::GetPropertyFailed(status));
+        }
+
+        eprintln!("[DEBUG] Got default device ID: {}", device_id);
+
+        if device_id == 0 {
+            return Err(OutputError::NoDefaultDevice);
+        }
+
+        let sample_rates = Self::get_supported_sample_rates(device_id)?;
+        eprintln!("[DEBUG] Supported sample rates: {:?}", sample_rates);
+
+        let current_rate = Self::get_current_sample_rate(device_id)?;
+        eprintln!("[DEBUG] Current sample rate: {}", current_rate);
+
+        Ok(DeviceInfo {
+            id: device_id,
+            name: "Default Output".to_string(),
+            supported_sample_rates: sample_rates,
+            current_sample_rate: current_rate,
+        })
+    }
+
+    /// 获取设备支持的采样率
+    fn get_supported_sample_rates(device_id: AudioDeviceID) -> Result<Vec<f64>, OutputError> {
+        let address = AudioObjectPropertyAddress {
+            selector: K_AUDIO_DEVICE_PROPERTY_AVAILABLE_NOMINAL_SAMPLE_RATES,
+            scope: K_AUDIO_OBJECT_PROPERTY_SCOPE_OUTPUT,
+            element: K_AUDIO_OBJECT_PROPERTY_ELEMENT_MAIN,
+        };
+
+        let mut size: u32 = 0;
+        let status = unsafe {
+            AudioObjectGetPropertyDataSize(device_id, &address, 0, ptr::null(), &mut size)
+        };
+
+        // 蓝牙设备（如 AirPods）可能不支持此属性，返回常见采样率
+        if status != NO_ERR {
+            log::warn!(
+                "Failed to query sample rates (status {}), using defaults for Bluetooth device",
+                status
+            );
+            return Ok(vec![44100.0, 48000.0]);
+        }
+
+        let count = size as usize / std::mem::size_of::<AudioValueRange>();
+        let mut ranges: Vec<AudioValueRange> = Vec::with_capacity(count);
+        unsafe {
+            ranges.set_len(count);
+        }
+
+        let status = unsafe {
+            AudioObjectGetPropertyData(
+                device_id,
+                &address,
+                0,
+                ptr::null(),
+                &mut size,
+                ranges.as_mut_ptr() as *mut c_void,
+            )
+        };
+
+        if status != NO_ERR {
+            log::warn!(
+                "Failed to get sample rates (status {}), using defaults",
+                status
+            );
+            return Ok(vec![44100.0, 48000.0]);
+        }
+
+        let mut rates: Vec<f64> = ranges
+            .iter()
+            .flat_map(|r| {
+                if (r.minimum - r.maximum).abs() < 0.1 {
+                    vec![r.minimum]
+                } else {
+                    vec![44100.0, 48000.0, 88200.0, 96000.0, 176400.0, 192000.0]
+                        .into_iter()
+                        .filter(|&rate| rate >= r.minimum && rate <= r.maximum)
+                        .collect()
+                }
+            })
+            .collect();
+
+        rates.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        rates.dedup();
+
+        Ok(rates)
+    }
+
+    /// 获取当前采样率
+    fn get_current_sample_rate(device_id: AudioDeviceID) -> Result<f64, OutputError> {
+        let address = AudioObjectPropertyAddress {
+            selector: K_AUDIO_DEVICE_PROPERTY_NOMINAL_SAMPLE_RATE,
+            scope: K_AUDIO_OBJECT_PROPERTY_SCOPE_OUTPUT,
+            element: K_AUDIO_OBJECT_PROPERTY_ELEMENT_MAIN,
+        };
+
+        let mut rate: f64 = 0.0;
+        let mut size = std::mem::size_of::<f64>() as u32;
+
+        let status = unsafe {
+            AudioObjectGetPropertyData(
+                device_id,
+                &address,
+                0,
+                ptr::null(),
+                &mut size,
+                &mut rate as *mut _ as *mut c_void,
+            )
+        };
+
+        if status != NO_ERR {
+            // 蓝牙设备可能不支持此属性，尝试 GLOBAL scope
+            let address_global = AudioObjectPropertyAddress {
+                selector: K_AUDIO_DEVICE_PROPERTY_NOMINAL_SAMPLE_RATE,
+                scope: K_AUDIO_OBJECT_PROPERTY_SCOPE_GLOBAL,
+                element: K_AUDIO_OBJECT_PROPERTY_ELEMENT_MAIN,
+            };
+
+            let status = unsafe {
+                AudioObjectGetPropertyData(
+                    device_id,
+                    &address_global,
+                    0,
+                    ptr::null(),
+                    &mut size,
+                    &mut rate as *mut _ as *mut c_void,
+                )
+            };
+
+            if status != NO_ERR {
+                log::warn!(
+                    "Failed to get current sample rate (status {}), using 48000 Hz",
+                    status
+                );
+                return Ok(48000.0);
+            }
+        }
+
+        Ok(rate)
+    }
+
+    /// 选择最优采样率
+    ///
+    /// 优先级：
+    /// 1. 精确匹配
+    /// 2. 整数倍关系（96→48, 88.2→44.1）
+    /// 3. 最接近的高采样率
+    fn select_optimal_sample_rate(requested: f64, supported: &[f64]) -> f64 {
+        if supported.is_empty() {
+            return requested;
+        }
+
+        // 1. 精确匹配
+        for &rate in supported {
+            if (rate - requested).abs() < 1.0 {
+                return rate;
+            }
+        }
+
+        // 2. 整数倍关系 - 优先下采样（96→48）
+        // 44100 系列：44100, 88200, 176400
+        // 48000 系列：48000, 96000, 192000
+        let rate_families: [(f64, &[f64]); 2] = [
+            (44100.0, &[44100.0, 88200.0, 176400.0]),
+            (48000.0, &[48000.0, 96000.0, 192000.0]),
+        ];
+
+        // 确定请求的采样率属于哪个系列
+        let requested_family = if (requested / 44100.0).fract().abs() < 0.01 {
+            Some(44100.0)
+        } else if (requested / 48000.0).fract().abs() < 0.01 {
+            Some(48000.0)
+        } else {
+            None
+        };
+
+        if let Some(base) = requested_family {
+            // 找同系列中设备支持的整数分频采样率
+            let family = rate_families.iter().find(|(b, _)| (*b - base).abs() < 1.0);
+            if let Some((_, rates)) = family {
+                // 从请求的采样率开始向下找
+                for &rate in rates.iter().rev() {
+                    if rate <= requested + 1.0 {
+                        for &supported_rate in supported {
+                            if (supported_rate - rate).abs() < 1.0 {
+                                eprintln!(
+                                    "[DEBUG] Sample rate fallback: {} → {} Hz (integer division)",
+                                    requested, supported_rate
+                                );
+                                return supported_rate;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 3. 最接近的采样率（优先选择大于等于请求的）
+        let mut best = supported[0];
+        let mut best_diff = (best - requested).abs();
+
+        for &rate in supported {
+            let diff = (rate - requested).abs();
+            // 优先选择大于等于请求的采样率
+            if rate >= requested && diff < best_diff {
+                best = rate;
+                best_diff = diff;
+            } else if rate < requested && best < requested && diff < best_diff {
+                best = rate;
+                best_diff = diff;
+            }
+        }
+
+        eprintln!(
+            "[DEBUG] Sample rate fallback: {} → {} Hz (nearest)",
+            requested, best
+        );
+        best
+    }
+
+    /// 设置采样率（带智能选择和验证）
+    ///
+    /// 先检查设备支持的采样率，选择最优值，然后设置并验证
+    fn set_sample_rate_smart(
+        device_id: AudioDeviceID,
+        requested_rate: f64,
+        supported_rates: &[f64],
+    ) -> Result<f64, OutputError> {
+        // 选择最优采样率
+        let rate = Self::select_optimal_sample_rate(requested_rate, supported_rates);
+
+        // 如果选择的采样率与请求不同，记录日志
+        if (rate - requested_rate).abs() > 1.0 {
+            log::info!(
+                "Sample rate {} Hz not supported, using {} Hz instead",
+                requested_rate, rate
+            );
+        }
+
+        // 设置采样率
+        Self::set_sample_rate(device_id, rate)?;
+
+        Ok(rate)
+    }
+
+    /// 设置采样率（带验证）
+    ///
+    /// 设置后验证采样率是否正确切换，最多重试 3 次
+    fn set_sample_rate(device_id: AudioDeviceID, rate: f64) -> Result<(), OutputError> {
+        let address = AudioObjectPropertyAddress {
+            selector: K_AUDIO_DEVICE_PROPERTY_NOMINAL_SAMPLE_RATE,
+            scope: K_AUDIO_OBJECT_PROPERTY_SCOPE_OUTPUT,
+            element: K_AUDIO_OBJECT_PROPERTY_ELEMENT_MAIN,
+        };
+
+        let status = unsafe {
+            AudioObjectSetPropertyData(
+                device_id,
+                &address,
+                0,
+                ptr::null(),
+                std::mem::size_of::<f64>() as u32,
+                &rate as *const _ as *const c_void,
+            )
+        };
+
+        if status != NO_ERR {
+            // 蓝牙设备可能不支持设置采样率，尝试 GLOBAL scope
+            let address_global = AudioObjectPropertyAddress {
+                selector: K_AUDIO_DEVICE_PROPERTY_NOMINAL_SAMPLE_RATE,
+                scope: K_AUDIO_OBJECT_PROPERTY_SCOPE_GLOBAL,
+                element: K_AUDIO_OBJECT_PROPERTY_ELEMENT_MAIN,
+            };
+
+            let status = unsafe {
+                AudioObjectSetPropertyData(
+                    device_id,
+                    &address_global,
+                    0,
+                    ptr::null(),
+                    std::mem::size_of::<f64>() as u32,
+                    &rate as *const _ as *const c_void,
+                )
+            };
+
+            if status != NO_ERR {
+                // 蓝牙设备通常不支持更改采样率，继续使用设备默认采样率
+                log::warn!(
+                    "Cannot set sample rate to {} Hz (status {}), using device default",
+                    rate,
+                    status
+                );
+                return Ok(());
+            }
+        }
+
+        // 验证采样率切换是否成功（带重试）
+        const MAX_RETRIES: u32 = 10;
+        const RETRY_DELAY_MS: u64 = 20;
+        const TOLERANCE: f64 = 1.0; // 允许 1Hz 误差
+
+        for attempt in 0..MAX_RETRIES {
+            std::thread::sleep(std::time::Duration::from_millis(RETRY_DELAY_MS));
+
+            if let Ok(actual_rate) = Self::get_current_sample_rate(device_id) {
+                if (actual_rate - rate).abs() < TOLERANCE {
+                    eprintln!(
+                        "[DEBUG] Sample rate verified: {} Hz (attempt {})",
+                        actual_rate, attempt + 1
+                    );
+                    return Ok(());
+                }
+                eprintln!(
+                    "[DEBUG] Sample rate mismatch: requested {} Hz, got {} Hz (attempt {})",
+                    rate, actual_rate, attempt + 1
+                );
+            }
+        }
+
+        // 验证失败但不阻止播放，记录警告
+        log::warn!(
+            "Sample rate verification failed after {} attempts, requested {} Hz",
+            MAX_RETRIES, rate
+        );
+        Ok(())
+    }
+
+    /// 设置缓冲区大小
+    fn set_buffer_size(device_id: AudioDeviceID, frames: u32) -> Result<(), OutputError> {
+        let address = AudioObjectPropertyAddress {
+            selector: K_AUDIO_DEVICE_PROPERTY_BUFFER_FRAME_SIZE,
+            scope: K_AUDIO_OBJECT_PROPERTY_SCOPE_OUTPUT,
+            element: K_AUDIO_OBJECT_PROPERTY_ELEMENT_MAIN,
+        };
+
+        let status = unsafe {
+            AudioObjectSetPropertyData(
+                device_id,
+                &address,
+                0,
+                ptr::null(),
+                std::mem::size_of::<u32>() as u32,
+                &frames as *const _ as *const c_void,
+            )
+        };
+
+        if status != NO_ERR {
+            // 蓝牙设备可能不支持设置缓冲区大小
+            log::warn!(
+                "Cannot set buffer size to {} frames (status {}), using device default",
+                frames,
+                status
+            );
+        }
+
+        Ok(())
+    }
+
+    /// 获取缓冲区大小
+    fn get_buffer_size(device_id: AudioDeviceID) -> Result<u32, OutputError> {
+        let address = AudioObjectPropertyAddress {
+            selector: K_AUDIO_DEVICE_PROPERTY_BUFFER_FRAME_SIZE,
+            scope: K_AUDIO_OBJECT_PROPERTY_SCOPE_OUTPUT,
+            element: K_AUDIO_OBJECT_PROPERTY_ELEMENT_MAIN,
+        };
+
+        let mut frames: u32 = 0;
+        let mut size = std::mem::size_of::<u32>() as u32;
+
+        let status = unsafe {
+            AudioObjectGetPropertyData(
+                device_id,
+                &address,
+                0,
+                ptr::null(),
+                &mut size,
+                &mut frames as *mut _ as *mut c_void,
+            )
+        };
+
+        if status != NO_ERR {
+            // 蓝牙设备可能不支持查询，返回默认值
+            log::warn!(
+                "Cannot get buffer size (status {}), using default 512 frames",
+                status
+            );
+            return Ok(512);
+        }
+
+        Ok(frames)
+    }
+
+    /// 尝试获取独占模式
+    fn acquire_hog_mode(device_id: AudioDeviceID) -> Result<bool, OutputError> {
+        let address = AudioObjectPropertyAddress {
+            selector: K_AUDIO_DEVICE_PROPERTY_HOG_MODE,
+            scope: K_AUDIO_OBJECT_PROPERTY_SCOPE_OUTPUT,
+            element: K_AUDIO_OBJECT_PROPERTY_ELEMENT_MAIN,
+        };
+
+        let pid = unsafe { libc::getpid() };
+
+        let status = unsafe {
+            AudioObjectSetPropertyData(
+                device_id,
+                &address,
+                0,
+                ptr::null(),
+                std::mem::size_of::<i32>() as u32,
+                &pid as *const _ as *const c_void,
+            )
+        };
+
+        Ok(status == NO_ERR)
+    }
+
+    /// 释放独占模式
+    fn release_hog_mode(device_id: AudioDeviceID) {
+        let address = AudioObjectPropertyAddress {
+            selector: K_AUDIO_DEVICE_PROPERTY_HOG_MODE,
+            scope: K_AUDIO_OBJECT_PROPERTY_SCOPE_OUTPUT,
+            element: K_AUDIO_OBJECT_PROPERTY_ELEMENT_MAIN,
+        };
+
+        let pid: i32 = -1;
+
+        let _ = unsafe {
+            AudioObjectSetPropertyData(
+                device_id,
+                &address,
+                0,
+                ptr::null(),
+                std::mem::size_of::<i32>() as u32,
+                &pid as *const _ as *const c_void,
+            )
+        };
+    }
+
+    /// 创建 AUHAL 输出
+    ///
+    /// 优先使用 HALOutput 绕过系统混音器，直接访问设备
+    /// 如果失败则回退到 DefaultOutput
+    pub fn new(config: OutputConfig) -> Result<Self, OutputError> {
+        // 首先尝试 HALOutput（绕过混音器，更低延迟，更干净的信号路径）
+        let desc_hal = AudioComponentDescription {
+            component_type: K_AUDIO_UNIT_TYPE_OUTPUT,
+            component_sub_type: K_AUDIO_UNIT_SUB_TYPE_HAL_OUTPUT,
+            component_manufacturer: K_AUDIO_UNIT_MANUFACTURER_APPLE,
+            component_flags: 0,
+            component_flags_mask: 0,
+        };
+
+        let component_hal = unsafe { AudioComponentFindNext(ptr::null_mut(), &desc_hal) };
+        if !component_hal.is_null() {
+            eprintln!("[DEBUG] Found HALOutput component, using direct device access");
+            match Self::new_hal_output(component_hal, config.clone()) {
+                Ok(output) => return Ok(output),
+                Err(e) => {
+                    eprintln!("[DEBUG] HALOutput failed: {:?}, falling back to DefaultOutput", e);
+                }
+            }
+        }
+
+        // 回退到 DefaultOutput（通过系统混音器）
+        eprintln!("[DEBUG] Using DefaultOutput (via system mixer)");
+        let desc = AudioComponentDescription {
+            component_type: K_AUDIO_UNIT_TYPE_OUTPUT,
+            component_sub_type: K_AUDIO_UNIT_SUB_TYPE_DEFAULT_OUTPUT,
+            component_manufacturer: K_AUDIO_UNIT_MANUFACTURER_APPLE,
+            component_flags: 0,
+            component_flags_mask: 0,
+        };
+
+        let component = unsafe { AudioComponentFindNext(ptr::null_mut(), &desc) };
+        if component.is_null() {
+            return Err(OutputError::NoAudioComponent);
+        }
+
+        Self::new_default_output(component, config)
+    }
+
+    /// 使用 HALOutput 创建输出（绕过系统混音器）
+    fn new_hal_output(component: AudioComponent, config: OutputConfig) -> Result<Self, OutputError> {
+        let mut audio_unit: AudioUnit = ptr::null_mut();
+        let status = unsafe { AudioComponentInstanceNew(component, &mut audio_unit) };
+        if status != NO_ERR {
+            return Err(OutputError::AudioUnitFailed(status));
+        }
+
+        // 获取默认输出设备
+        let device = Self::get_default_device()?;
+        eprintln!("[DEBUG] HALOutput: using device {} ({}Hz)", device.id, device.current_sample_rate);
+
+        // 设置输出设备
+        let status = unsafe {
+            AudioUnitSetProperty(
+                audio_unit,
+                K_AUDIO_OUTPUT_UNIT_PROPERTY_CURRENT_DEVICE,
+                K_AUDIO_UNIT_SCOPE_GLOBAL,
+                0,
+                &device.id as *const _ as *const c_void,
+                std::mem::size_of::<AudioDeviceID>() as u32,
+            )
+        };
+        if status != NO_ERR {
+            eprintln!("[DEBUG] Failed to set HALOutput device (status: {})", status);
+            unsafe { AudioComponentInstanceDispose(audio_unit) };
+            return Err(OutputError::AudioUnitFailed(status));
+        }
+
+        Ok(Self {
+            device_id: device.id,
+            audio_unit,
+            config,
+            context: None,
+            original_sample_rate: device.current_sample_rate,
+            hog_mode_acquired: false,
+            actual_format: AudioFormat::new(48000, 2, 32),
+            supported_sample_rates: device.supported_sample_rates,
+        })
+    }
+
+    /// 使用 DefaultOutput 创建输出（通过系统混音器）
+    fn new_default_output(component: AudioComponent, config: OutputConfig) -> Result<Self, OutputError> {
+        let mut audio_unit: AudioUnit = ptr::null_mut();
+        let status = unsafe { AudioComponentInstanceNew(component, &mut audio_unit) };
+        if status != NO_ERR {
+            return Err(OutputError::AudioUnitFailed(status));
+        }
+
+        // DefaultOutput 不需要手动设置设备
+        eprintln!("[DEBUG] DefaultOutput: using system default device");
+
+        Ok(Self {
+            device_id: 0,  // DefaultOutput 不使用具体设备 ID
+            audio_unit,
+            config,
+            context: None,
+            original_sample_rate: 48000.0,
+            hog_mode_acquired: false,
+            actual_format: AudioFormat::new(48000, 2, 32),
+            supported_sample_rates: vec![44100.0, 48000.0],  // DefaultOutput 常见支持率
+        })
+    }
+
+    /// 查询输出布局
+    fn query_output_layout(&self) -> Result<OutputLayout, OutputError> {
+        let mut asbd = AudioStreamBasicDescription::default();
+        let mut size = std::mem::size_of::<AudioStreamBasicDescription>() as u32;
+
+        let status = unsafe {
+            AudioUnitGetProperty(
+                self.audio_unit,
+                K_AUDIO_UNIT_PROPERTY_STREAM_FORMAT,
+                K_AUDIO_UNIT_SCOPE_OUTPUT,
+                0,
+                &mut asbd as *mut _ as *mut c_void,
+                &mut size,
+            )
+        };
+
+        if status != NO_ERR {
+            // 默认为 Interleaved
+            return Ok(OutputLayout::Interleaved);
+        }
+
+        if asbd.is_non_interleaved() {
+            Ok(OutputLayout::NonInterleaved)
+        } else {
+            Ok(OutputLayout::Interleaved)
+        }
+    }
+
+    /// 获取设备的输出流 ID
+    fn get_output_stream_id(device_id: AudioDeviceID) -> Option<u32> {
+        let address = AudioObjectPropertyAddress {
+            selector: K_AUDIO_DEVICE_PROPERTY_STREAMS,
+            scope: K_AUDIO_OBJECT_PROPERTY_SCOPE_OUTPUT,
+            element: K_AUDIO_OBJECT_PROPERTY_ELEMENT_MAIN,
+        };
+
+        let mut size: u32 = 0;
+        let status = unsafe {
+            AudioObjectGetPropertyDataSize(device_id, &address, 0, ptr::null(), &mut size)
+        };
+
+        if status != NO_ERR || size == 0 {
+            return None;
+        }
+
+        let count = size as usize / std::mem::size_of::<u32>();
+        let mut streams: Vec<u32> = vec![0; count];
+
+        let status = unsafe {
+            AudioObjectGetPropertyData(
+                device_id,
+                &address,
+                0,
+                ptr::null(),
+                &mut size,
+                streams.as_mut_ptr() as *mut c_void,
+            )
+        };
+
+        if status != NO_ERR || streams.is_empty() {
+            return None;
+        }
+
+        Some(streams[0])
+    }
+
+    /// 获取流的物理格式
+    fn get_physical_format(stream_id: u32) -> Option<AudioStreamBasicDescription> {
+        let address = AudioObjectPropertyAddress {
+            selector: K_AUDIO_STREAM_PROPERTY_PHYSICAL_FORMAT,
+            scope: K_AUDIO_OBJECT_PROPERTY_SCOPE_OUTPUT,
+            element: K_AUDIO_OBJECT_PROPERTY_ELEMENT_MAIN,
+        };
+
+        let mut asbd = AudioStreamBasicDescription::default();
+        let mut size = std::mem::size_of::<AudioStreamBasicDescription>() as u32;
+
+        let status = unsafe {
+            AudioObjectGetPropertyData(
+                stream_id,
+                &address,
+                0,
+                ptr::null(),
+                &mut size,
+                &mut asbd as *mut _ as *mut c_void,
+            )
+        };
+
+        if status != NO_ERR {
+            return None;
+        }
+
+        Some(asbd)
+    }
+
+    /// 设置流的物理格式
+    fn set_physical_format(stream_id: u32, format: &AudioStreamBasicDescription) -> bool {
+        let address = AudioObjectPropertyAddress {
+            selector: K_AUDIO_STREAM_PROPERTY_PHYSICAL_FORMAT,
+            scope: K_AUDIO_OBJECT_PROPERTY_SCOPE_OUTPUT,
+            element: K_AUDIO_OBJECT_PROPERTY_ELEMENT_MAIN,
+        };
+
+        let status = unsafe {
+            AudioObjectSetPropertyData(
+                stream_id,
+                &address,
+                0,
+                ptr::null(),
+                std::mem::size_of::<AudioStreamBasicDescription>() as u32,
+                format as *const _ as *const c_void,
+            )
+        };
+
+        status == NO_ERR
+    }
+
+    /// 尝试设置物理流格式（直接硬件访问）
+    ///
+    /// 这是最直接的信号路径，绕过所有格式转换。
+    /// 需要设备支持，返回成功与否和实际使用的格式。
+    fn try_set_physical_format(&self, format: &AudioFormat) -> Option<(AudioStreamBasicDescription, OutputFormatMode)> {
+        // 获取输出流 ID
+        let stream_id = Self::get_output_stream_id(self.device_id)?;
+        eprintln!("[DEBUG] Output stream ID: {}", stream_id);
+
+        // 获取当前物理格式
+        if let Some(current) = Self::get_physical_format(stream_id) {
+            eprintln!(
+                "[DEBUG] Current physical format: {}Hz, {} channels, {} bits, flags=0x{:x}",
+                current.sample_rate,
+                current.channels_per_frame,
+                current.bits_per_channel,
+                current.format_flags
+            );
+        }
+
+        // 尝试设置 32-bit 整数物理格式
+        let asbd_int32 = AudioStreamBasicDescription {
+            sample_rate: format.sample_rate as f64,
+            format_id: K_AUDIO_FORMAT_LINEAR_PCM,
+            format_flags: K_AUDIO_FORMAT_FLAG_IS_SIGNED_INTEGER | K_AUDIO_FORMAT_FLAG_IS_PACKED,
+            bytes_per_packet: 4 * format.channels as u32,
+            frames_per_packet: 1,
+            bytes_per_frame: 4 * format.channels as u32,
+            channels_per_frame: format.channels as u32,
+            bits_per_channel: 32,
+            reserved: 0,
+        };
+
+        if Self::set_physical_format(stream_id, &asbd_int32) {
+            // 验证设置成功
+            if let Some(actual) = Self::get_physical_format(stream_id) {
+                if actual.bits_per_channel == 32
+                    && (actual.format_flags & K_AUDIO_FORMAT_FLAG_IS_SIGNED_INTEGER) != 0
+                {
+                    eprintln!("[DEBUG] Physical format set to Int32 (direct hardware path)");
+                    return Some((actual, OutputFormatMode::Int32));
+                }
+            }
+        }
+
+        // 尝试 24-bit 整数
+        let asbd_int24 = AudioStreamBasicDescription {
+            sample_rate: format.sample_rate as f64,
+            format_id: K_AUDIO_FORMAT_LINEAR_PCM,
+            format_flags: K_AUDIO_FORMAT_FLAG_IS_SIGNED_INTEGER | K_AUDIO_FORMAT_FLAG_IS_PACKED,
+            bytes_per_packet: 3 * format.channels as u32,
+            frames_per_packet: 1,
+            bytes_per_frame: 3 * format.channels as u32,
+            channels_per_frame: format.channels as u32,
+            bits_per_channel: 24,
+            reserved: 0,
+        };
+
+        if Self::set_physical_format(stream_id, &asbd_int24) {
+            if let Some(actual) = Self::get_physical_format(stream_id) {
+                if actual.bits_per_channel == 24 {
+                    eprintln!("[DEBUG] Physical format set to Int24 (direct hardware path)");
+                    return Some((actual, OutputFormatMode::Int24));
+                }
+            }
+        }
+
+        eprintln!("[DEBUG] Physical format setting failed, using ASBD format");
+        None
+    }
+
+    /// 尝试设置整数输出格式
+    ///
+    /// 整数格式避免了 i32 → f32 的转换，信号路径更直接。
+    /// 返回 (成功与否, 输出格式模式)
+    fn try_set_integer_format(&self, format: &AudioFormat) -> (bool, OutputFormatMode) {
+        // 优先尝试 32-bit Integer
+        let asbd_int32 = AudioStreamBasicDescription {
+            sample_rate: format.sample_rate as f64,
+            format_id: K_AUDIO_FORMAT_LINEAR_PCM,
+            format_flags: K_AUDIO_FORMAT_FLAG_IS_SIGNED_INTEGER | K_AUDIO_FORMAT_FLAG_IS_PACKED,
+            bytes_per_packet: 4 * format.channels as u32,
+            frames_per_packet: 1,
+            bytes_per_frame: 4 * format.channels as u32,
+            channels_per_frame: format.channels as u32,
+            bits_per_channel: 32,
+            reserved: 0,
+        };
+
+        let status = unsafe {
+            AudioUnitSetProperty(
+                self.audio_unit,
+                K_AUDIO_UNIT_PROPERTY_STREAM_FORMAT,
+                K_AUDIO_UNIT_SCOPE_INPUT,
+                0,
+                &asbd_int32 as *const _ as *const c_void,
+                std::mem::size_of::<AudioStreamBasicDescription>() as u32,
+            )
+        };
+
+        if status == NO_ERR {
+            eprintln!("[DEBUG] Integer 32-bit output mode enabled (bit-perfect path)");
+            return (true, OutputFormatMode::Int32);
+        }
+
+        eprintln!("[DEBUG] Int32 format not supported (status: {}), trying Int24", status);
+
+        // 尝试 24-bit Integer (packed)
+        let asbd_int24 = AudioStreamBasicDescription {
+            sample_rate: format.sample_rate as f64,
+            format_id: K_AUDIO_FORMAT_LINEAR_PCM,
+            format_flags: K_AUDIO_FORMAT_FLAG_IS_SIGNED_INTEGER | K_AUDIO_FORMAT_FLAG_IS_PACKED,
+            bytes_per_packet: 3 * format.channels as u32,
+            frames_per_packet: 1,
+            bytes_per_frame: 3 * format.channels as u32,
+            channels_per_frame: format.channels as u32,
+            bits_per_channel: 24,
+            reserved: 0,
+        };
+
+        let status = unsafe {
+            AudioUnitSetProperty(
+                self.audio_unit,
+                K_AUDIO_UNIT_PROPERTY_STREAM_FORMAT,
+                K_AUDIO_UNIT_SCOPE_INPUT,
+                0,
+                &asbd_int24 as *const _ as *const c_void,
+                std::mem::size_of::<AudioStreamBasicDescription>() as u32,
+            )
+        };
+
+        if status == NO_ERR {
+            eprintln!("[DEBUG] Integer 24-bit output mode enabled");
+            return (true, OutputFormatMode::Int24);
+        }
+
+        eprintln!("[DEBUG] Integer formats not supported, using Float32");
+        (false, OutputFormatMode::Float32)
+    }
+
+    /// 启动输出
+    pub fn start(
+        &mut self,
+        format: AudioFormat,
+        ring_buffer: Arc<RingBuffer<i32>>,
+        stats: Arc<PlaybackStats>,
+    ) -> Result<(), OutputError> {
+        // 如果有有效的 device_id，尝试设备相关操作
+        if self.device_id != 0 {
+            // 尝试独占模式
+            if self.config.exclusive_mode {
+                self.hog_mode_acquired = Self::acquire_hog_mode(self.device_id)?;
+                if self.hog_mode_acquired {
+                    log::info!("Acquired exclusive (hog) mode");
+                } else {
+                    log::warn!("Failed to acquire exclusive mode, continuing in shared mode");
+                }
+            }
+
+            // 智能选择并设置采样率
+            let actual_rate = Self::set_sample_rate_smart(
+                self.device_id,
+                self.config.sample_rate as f64,
+                &self.supported_sample_rates,
+            )?;
+            // 更新 config 中的采样率为实际使用的值
+            self.config.sample_rate = actual_rate as u32;
+
+            // 设置缓冲区大小
+            Self::set_buffer_size(self.device_id, self.config.buffer_frames)?;
+
+            // 设置输出设备
+            let status = unsafe {
+                AudioUnitSetProperty(
+                    self.audio_unit,
+                    K_AUDIO_OUTPUT_UNIT_PROPERTY_CURRENT_DEVICE,
+                    K_AUDIO_UNIT_SCOPE_GLOBAL,
+                    0,
+                    &self.device_id as *const _ as *const c_void,
+                    std::mem::size_of::<AudioDeviceID>() as u32,
+                )
+            };
+            if status != NO_ERR {
+                eprintln!("[DEBUG] Failed to set output device (status: {}), continuing anyway", status);
+            }
+        } else {
+            eprintln!("[DEBUG] Using DefaultOutput unit, skipping device configuration");
+        }
+
+        // 启用输出（DefaultOutput 可能不支持此属性，忽略错误）
+        let enable_io: u32 = 1;
+        let status = unsafe {
+            AudioUnitSetProperty(
+                self.audio_unit,
+                K_AUDIO_OUTPUT_UNIT_PROPERTY_ENABLE_IO,
+                K_AUDIO_UNIT_SCOPE_OUTPUT,
+                0,
+                &enable_io as *const _ as *const c_void,
+                std::mem::size_of::<u32>() as u32,
+            )
+        };
+        if status != NO_ERR {
+            eprintln!("[DEBUG] EnableIO not supported (status: {}), continuing anyway", status);
+        }
+
+        // 尝试设置流格式
+        // 优先级：Physical Format (直接硬件) > ASBD Integer > Float32
+        let output_mode = if self.config.integer_mode && self.device_id != 0 {
+            // 首先尝试物理格式（最直接的硬件访问路径）
+            if let Some((_, mode)) = self.try_set_physical_format(&format) {
+                eprintln!("[DEBUG] Using physical format (direct hardware path)");
+                mode
+            } else {
+                // 回退到 ASBD 格式
+                let (success, mode) = self.try_set_integer_format(&format);
+                if success {
+                    mode
+                } else {
+                    // 回退到 Float32
+                    let asbd = AudioStreamBasicDescription {
+                        sample_rate: format.sample_rate as f64,
+                        format_id: K_AUDIO_FORMAT_LINEAR_PCM,
+                        format_flags: K_AUDIO_FORMAT_FLAG_IS_FLOAT | K_AUDIO_FORMAT_FLAG_IS_PACKED,
+                        bytes_per_packet: 4 * format.channels as u32,
+                        frames_per_packet: 1,
+                        bytes_per_frame: 4 * format.channels as u32,
+                        channels_per_frame: format.channels as u32,
+                        bits_per_channel: 32,
+                        reserved: 0,
+                    };
+
+                    let status = unsafe {
+                        AudioUnitSetProperty(
+                            self.audio_unit,
+                            K_AUDIO_UNIT_PROPERTY_STREAM_FORMAT,
+                            K_AUDIO_UNIT_SCOPE_INPUT,
+                            0,
+                            &asbd as *const _ as *const c_void,
+                            std::mem::size_of::<AudioStreamBasicDescription>() as u32,
+                        )
+                    };
+                    if status != NO_ERR {
+                        eprintln!("[DEBUG] Failed to set Float32 format (status: {})", status);
+                    }
+                    OutputFormatMode::Float32
+                }
+            }
+        } else {
+            // DefaultOutput 使用 Float32
+            eprintln!("[DEBUG] Setting stream format: {}Hz, {} channels, Float32", format.sample_rate, format.channels);
+            let asbd = AudioStreamBasicDescription {
+                sample_rate: format.sample_rate as f64,
+                format_id: K_AUDIO_FORMAT_LINEAR_PCM,
+                format_flags: K_AUDIO_FORMAT_FLAG_IS_FLOAT | K_AUDIO_FORMAT_FLAG_IS_PACKED,
+                bytes_per_packet: 4 * format.channels as u32,
+                frames_per_packet: 1,
+                bytes_per_frame: 4 * format.channels as u32,
+                channels_per_frame: format.channels as u32,
+                bits_per_channel: 32,
+                reserved: 0,
+            };
+
+            let status = unsafe {
+                AudioUnitSetProperty(
+                    self.audio_unit,
+                    K_AUDIO_UNIT_PROPERTY_STREAM_FORMAT,
+                    K_AUDIO_UNIT_SCOPE_INPUT,
+                    0,
+                    &asbd as *const _ as *const c_void,
+                    std::mem::size_of::<AudioStreamBasicDescription>() as u32,
+                )
+            };
+            if status != NO_ERR {
+                eprintln!("[DEBUG] Failed to set Float32 format (status: {})", status);
+            }
+            OutputFormatMode::Float32
+        };
+
+        // 查询实际的 buffer size（如果失败使用较大默认值）
+        let buffer_frames = if self.device_id != 0 {
+            Self::get_buffer_size(self.device_id).unwrap_or(4096)
+        } else {
+            4096  // DefaultOutput 使用较大缓冲区
+        };
+        // 使用更大的缓冲区以处理可变的 callback 大小
+        let max_samples_per_callback = buffer_frames.max(8192) as usize * format.channels as usize;
+        eprintln!("[DEBUG] Buffer frames: {}, max samples: {}", buffer_frames, max_samples_per_callback);
+
+        // 查询输出布局
+        let output_layout = self.query_output_layout()?;
+
+        // 预分配 sample_buffer（足够大以处理任何 callback）
+        let sample_buffer = vec![0i32; max_samples_per_callback];
+
+        // 保存实际格式
+        self.actual_format = AudioFormat {
+            sample_rate: format.sample_rate,
+            channels: format.channels,
+            bits_per_sample: format.bits_per_sample,
+            layout: output_layout,
+        };
+
+        // 创建上下文（使用当前时间戳作为 dither 种子）
+        let dither_seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u32)
+            .unwrap_or(0xCAFEBABE);
+
+        let context = Box::new(CallbackContext {
+            ring_buffer: Arc::clone(&ring_buffer),
+            stats,
+            format: self.actual_format,
+            output_layout,
+            sample_buffer,
+            dither: DitherState::new(dither_seed),
+            output_mode,
+            source_bits: format.bits_per_sample,
+            running: AtomicBool::new(true),
+            thread_policy_set: AtomicBool::new(false),
+        });
+
+        // 锁定关键内存，防止 page fault
+        ring_buffer.lock_memory();
+        context.lock_memory();
+        eprintln!("[DEBUG] Memory locked for realtime safety");
+
+        let context_ptr = Box::into_raw(context);
+
+        // 设置 render callback
+        let callback_struct = AURenderCallbackStruct {
+            input_proc: render_callback,
+            input_proc_ref_con: context_ptr as *mut c_void,
+        };
+
+        let status = unsafe {
+            AudioUnitSetProperty(
+                self.audio_unit,
+                K_AUDIO_UNIT_PROPERTY_SET_RENDER_CALLBACK,
+                K_AUDIO_UNIT_SCOPE_INPUT,
+                0,
+                &callback_struct as *const _ as *const c_void,
+                std::mem::size_of::<AURenderCallbackStruct>() as u32,
+            )
+        };
+        if status != NO_ERR {
+            unsafe {
+                let _ = Box::from_raw(context_ptr);
+            }
+            return Err(OutputError::AudioUnitFailed(status));
+        }
+
+        self.context = Some(unsafe { Box::from_raw(context_ptr) });
+
+        // 初始化 AudioUnit
+        let status = unsafe { AudioUnitInitialize(self.audio_unit) };
+        if status != NO_ERR {
+            return Err(OutputError::AudioUnitFailed(status));
+        }
+
+        // 启动
+        let status = unsafe { AudioOutputUnitStart(self.audio_unit) };
+        if status != NO_ERR {
+            return Err(OutputError::AudioUnitFailed(status));
+        }
+
+        log::info!(
+            "Audio output started: {}Hz, {} channels, {}bit, {:?}, mode={:?}",
+            self.actual_format.sample_rate,
+            self.actual_format.channels,
+            self.actual_format.bits_per_sample,
+            self.actual_format.layout,
+            output_mode
+        );
+
+        Ok(())
+    }
+
+    /// 停止输出
+    pub fn stop(&mut self) -> Result<(), OutputError> {
+        if let Some(ref context) = self.context {
+            context.running.store(false, Ordering::Release);
+        }
+
+        if !self.audio_unit.is_null() {
+            let _ = unsafe { AudioOutputUnitStop(self.audio_unit) };
+            let _ = unsafe { AudioUnitUninitialize(self.audio_unit) };
+        }
+
+        // 释放独占模式
+        if self.hog_mode_acquired {
+            Self::release_hog_mode(self.device_id);
+            self.hog_mode_acquired = false;
+        }
+
+        // 恢复原始采样率
+        let _ = Self::set_sample_rate(self.device_id, self.original_sample_rate);
+
+        self.context = None;
+
+        log::info!("Audio output stopped");
+        Ok(())
+    }
+
+    /// 检查是否正在运行
+    pub fn is_running(&self) -> bool {
+        self.context
+            .as_ref()
+            .map(|c| c.running.load(Ordering::Acquire))
+            .unwrap_or(false)
+    }
+
+    /// 获取实际格式
+    pub fn actual_format(&self) -> AudioFormat {
+        self.actual_format
+    }
+}
+
+impl Drop for AudioOutput {
+    fn drop(&mut self) {
+        let _ = self.stop();
+
+        if !self.audio_unit.is_null() {
+            let _ = unsafe { AudioComponentInstanceDispose(self.audio_unit) };
+        }
+    }
+}
+
+/// Render Callback
+///
+/// **绝对禁止：**
+/// - 锁
+/// - 分配
+/// - I/O
+/// - println!
+extern "C" fn render_callback(
+    in_ref_con: *mut c_void,
+    _io_action_flags: *mut u32,
+    in_time_stamp: *const AudioTimeStamp,
+    _in_bus_number: u32,
+    in_number_frames: u32,
+    io_data: *mut AudioBufferList,
+) -> OSStatus {
+    let ctx = unsafe { &mut *(in_ref_con as *mut CallbackContext) };
+
+    if !ctx.running.load(Ordering::Acquire) {
+        return NO_ERR;
+    }
+
+    // 首次调用时设置 IO 线程的实时调度策略
+    // 使用 compare_exchange 确保只执行一次
+    if ctx.thread_policy_set
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        ctx.set_realtime_thread_policy();
+    }
+
+    let frames = in_number_frames as usize;
+    let channels = ctx.format.channels as usize;
+    let samples_needed = frames * channels;
+
+    // 统计（降频，内部判断）- 在读取数据前进行
+    // 使用 AudioTimeStamp 的 host_time 提升时序精度
+    let host_time = unsafe { (*in_time_stamp).valid_host_time() };
+    ctx.stats.on_callback_with_timestamp(&ctx.ring_buffer, host_time);
+
+    // 写入 AudioBufferList（根据 output_mode 选择路径）
+    let buffer_list = unsafe { &mut *io_data };
+
+    if buffer_list.number_buffers > 0 {
+        match ctx.output_mode {
+            OutputFormatMode::Int32 => {
+                // 零拷贝路径：直接从 ring buffer 读取到输出缓冲区
+                // 避免中间 sample_buffer 拷贝，bit-perfect + 最短路径
+                let output_ptr = buffer_list.buffers[0].data as *mut i32;
+                let output_samples = buffer_list.buffers[0].data_byte_size as usize / 4;
+                let output_slice = unsafe { std::slice::from_raw_parts_mut(output_ptr, output_samples) };
+
+                let count = samples_needed.min(output_slice.len());
+
+                // 直接读取到输出缓冲区（零拷贝，bit-perfect）
+                let samples_read = ctx.ring_buffer.read(&mut output_slice[..count]);
+                ctx.stats.add_samples_played(samples_read as u64);
+
+                // 填零（数据不够或输出缓冲区更大）
+                for i in samples_read..output_slice.len() {
+                    output_slice[i] = 0;
+                }
+
+                // 记录 underrun（如果数据不够）
+                if samples_read < count {
+                    ctx.stats.record_underrun();
+                }
+            }
+            OutputFormatMode::Int24 => {
+                // Int24/Float32 需要通过 sample_buffer 进行格式转换
+                let actual_samples = samples_needed.min(ctx.sample_buffer.len());
+                let sample_buffer = &mut ctx.sample_buffer[..actual_samples];
+                let samples_read = ctx.ring_buffer.read(sample_buffer);
+                ctx.stats.add_samples_played(samples_read as u64);
+
+                // 数据不够则填零 + 记录 underrun
+                if samples_read < actual_samples {
+                    ctx.stats.record_underrun();
+                    for i in samples_read..actual_samples {
+                        sample_buffer[i] = 0;
+                    }
+                }
+
+                // 24-bit packed 输出
+                let output_ptr = buffer_list.buffers[0].data as *mut u8;
+                let output_bytes = buffer_list.buffers[0].data_byte_size as usize;
+                let output_slice = unsafe { std::slice::from_raw_parts_mut(output_ptr, output_bytes) };
+
+                let count = actual_samples.min(output_bytes / 3);
+
+                // 源 ≤24-bit: bit-perfect 直接截取
+                // 源 >24-bit: 需要 dither（量化损失）
+                if ctx.source_bits <= 24 {
+                    // Bit-perfect 路径：直接截取高 24 位
+                    for i in 0..count {
+                        let bytes = sample_buffer[i].to_le_bytes();
+                        output_slice[i * 3] = bytes[1];
+                        output_slice[i * 3 + 1] = bytes[2];
+                        output_slice[i * 3 + 2] = bytes[3];
+                    }
+                } else {
+                    // 有损路径：添加 TPDF dither
+                    for i in 0..count {
+                        let sample = sample_buffer[i];
+                        let r1 = (ctx.dither.next_u32() & 0xFF) as i32;
+                        let r2 = (ctx.dither.next_u32() & 0xFF) as i32;
+                        let dither = (r1 + r2 - 256) << 8;
+                        let dithered = sample.saturating_add(dither);
+
+                        let bytes = dithered.to_le_bytes();
+                        output_slice[i * 3] = bytes[1];
+                        output_slice[i * 3 + 1] = bytes[2];
+                        output_slice[i * 3 + 2] = bytes[3];
+                    }
+                }
+
+                for i in (count * 3)..output_bytes {
+                    output_slice[i] = 0;
+                }
+            }
+            OutputFormatMode::Float32 => {
+                // Float32 需要通过 sample_buffer 进行格式转换
+                let actual_samples = samples_needed.min(ctx.sample_buffer.len());
+                let sample_buffer = &mut ctx.sample_buffer[..actual_samples];
+                let samples_read = ctx.ring_buffer.read(sample_buffer);
+                ctx.stats.add_samples_played(samples_read as u64);
+
+                // 数据不够则填零 + 记录 underrun
+                if samples_read < actual_samples {
+                    ctx.stats.record_underrun();
+                    for i in samples_read..actual_samples {
+                        sample_buffer[i] = 0;
+                    }
+                }
+
+                // Float32 输出 + TPDF dither
+                let output_ptr = buffer_list.buffers[0].data as *mut f32;
+                let output_samples = buffer_list.buffers[0].data_byte_size as usize / 4;
+                let output_slice = unsafe { std::slice::from_raw_parts_mut(output_ptr, output_samples) };
+
+                const DITHER_SCALE: f32 = 1.0 / 8388608.0; // 2^-23
+                const I32_TO_FLOAT: f32 = 1.0 / 2147483648.0; // 1 / 2^31
+
+                let count = actual_samples.min(output_slice.len());
+
+                // SIMD 优化路径（4 样本一批）
+                #[cfg(target_arch = "aarch64")]
+                {
+                    use std::arch::aarch64::*;
+                    let scale_vec = unsafe { vdupq_n_f32(I32_TO_FLOAT) };
+
+                    let chunks = count / 4;
+                    for chunk_idx in 0..chunks {
+                        let i = chunk_idx * 4;
+                        unsafe {
+                            // 加载 4 个 i32 样本
+                            let i32x4 = vld1q_s32(sample_buffer.as_ptr().add(i));
+                            // 转换为 f32
+                            let f32x4 = vcvtq_f32_s32(i32x4);
+                            // 乘以缩放因子
+                            let scaled = vmulq_f32(f32x4, scale_vec);
+                            // 添加 dither（标量，因为 dither 需要状态）
+                            let mut result = [0.0f32; 4];
+                            vst1q_f32(result.as_mut_ptr(), scaled);
+                            for j in 0..4 {
+                                let dither = ctx.dither.next_tpdf() * DITHER_SCALE;
+                                output_slice[i + j] = result[j] + dither;
+                            }
+                        }
+                    }
+
+                    // 处理剩余样本
+                    for i in (chunks * 4)..count {
+                        let sample = sample_buffer[i] as f32 * I32_TO_FLOAT;
+                        let dither = ctx.dither.next_tpdf() * DITHER_SCALE;
+                        output_slice[i] = sample + dither;
+                    }
+                }
+
+                // 非 ARM64 的标量路径
+                #[cfg(not(target_arch = "aarch64"))]
+                {
+                    for i in 0..count {
+                        let sample = sample_buffer[i] as f32 * I32_TO_FLOAT;
+                        let dither = ctx.dither.next_tpdf() * DITHER_SCALE;
+                        output_slice[i] = sample + dither;
+                    }
+                }
+
+                for i in count..output_slice.len() {
+                    output_slice[i] = 0.0;
+                }
+            }
+        }
+    }
+
+    NO_ERR
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[ignore] // 需要音频设备
+    fn test_get_default_device() {
+        let device = AudioOutput::get_default_device().unwrap();
+        println!("Device: {:?}", device);
+        assert!(!device.supported_sample_rates.is_empty());
+    }
+}

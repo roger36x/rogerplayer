@@ -1,0 +1,474 @@
+//! 播放引擎
+//!
+//! 整合解码、缓冲、输出各模块
+//! 核心设计：解码线程和输出回调完全解耦，通过 lock-free ring buffer 连接
+
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::{self, JoinHandle};
+
+use crate::audio::{AudioFormat, AudioOutput, OutputConfig, PlaybackStats, RingBuffer};
+use crate::decode::{AudioDecoder, AudioInfo, DecoderIterator};
+
+/// 播放状态
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlaybackState {
+    Stopped,
+    Playing,
+    Paused,
+    Buffering,
+}
+
+/// 引擎配置
+#[derive(Clone, Debug)]
+pub struct EngineConfig {
+    /// 输出配置
+    pub output: OutputConfig,
+    /// Ring buffer 大小（样本数，会被向上取整到 2 的幂）
+    /// 越大越稳定，但延迟也越高
+    pub buffer_frames: usize,
+    /// 预缓冲比例（0.0-1.0）
+    /// 开始播放前需要填充到这个比例
+    pub prebuffer_ratio: f64,
+}
+
+impl Default for EngineConfig {
+    fn default() -> Self {
+        Self {
+            output: OutputConfig::default(),
+            // 2秒缓冲 @ 48kHz 立体声
+            buffer_frames: 48000 * 2 * 2,
+            // 50% 预缓冲
+            prebuffer_ratio: 0.5,
+        }
+    }
+}
+
+/// 引擎错误
+#[derive(Debug)]
+pub enum EngineError {
+    DecodeError(crate::decode::DecodeError),
+    OutputError(crate::audio::OutputError),
+    InvalidState(&'static str),
+    SampleRateMismatch { source: u32, output: u32 },
+}
+
+impl std::fmt::Display for EngineError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DecodeError(e) => write!(f, "Decode error: {}", e),
+            Self::OutputError(e) => write!(f, "Output error: {}", e),
+            Self::InvalidState(s) => write!(f, "Invalid state: {}", s),
+            Self::SampleRateMismatch { source, output } => {
+                write!(
+                    f,
+                    "Sample rate mismatch: source {}Hz, output {}Hz",
+                    source, output
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for EngineError {}
+
+impl From<crate::decode::DecodeError> for EngineError {
+    fn from(e: crate::decode::DecodeError) -> Self {
+        Self::DecodeError(e)
+    }
+}
+
+impl From<crate::audio::OutputError> for EngineError {
+    fn from(e: crate::audio::OutputError) -> Self {
+        Self::OutputError(e)
+    }
+}
+
+/// 播放引擎统计
+#[derive(Debug, Clone)]
+pub struct EngineStats {
+    /// 缓冲区填充比例
+    pub buffer_fill_ratio: f64,
+    /// Underrun 次数
+    pub underrun_count: u64,
+    /// 已播放样本数
+    pub samples_played: u64,
+    /// 当前播放时间（秒）
+    pub position_secs: f64,
+}
+
+/// 解码线程共享状态
+struct DecoderState {
+    /// 是否应该继续运行
+    running: AtomicBool,
+    /// 是否暂停解码
+    paused: AtomicBool,
+    /// 已解码样本数
+    samples_decoded: AtomicU64,
+    /// 用于暂停/恢复通知的 Condvar
+    pause_cond: Condvar,
+    /// Condvar 所需的 Mutex（只在暂停时使用，不影响热路径）
+    pause_mutex: Mutex<()>,
+}
+
+/// 播放引擎
+pub struct Engine {
+    config: EngineConfig,
+    state: PlaybackState,
+    ring_buffer: Arc<RingBuffer<i32>>,
+    stats: Arc<PlaybackStats>,
+    output: Option<AudioOutput>,
+    decoder_thread: Option<JoinHandle<()>>,
+    decoder_state: Arc<DecoderState>,
+    current_info: Option<AudioInfo>,
+    current_format: Option<AudioFormat>,
+}
+
+impl Engine {
+    /// 创建新引擎
+    pub fn new(config: EngineConfig) -> Self {
+        // 向上取整到 2 的幂
+        let buffer_capacity = config.buffer_frames.next_power_of_two();
+        let ring_buffer = Arc::new(RingBuffer::new(buffer_capacity));
+        let stats = Arc::new(PlaybackStats::new());
+        let decoder_state = Arc::new(DecoderState {
+            running: AtomicBool::new(false),
+            paused: AtomicBool::new(false),
+            samples_decoded: AtomicU64::new(0),
+            pause_cond: Condvar::new(),
+            pause_mutex: Mutex::new(()),
+        });
+
+        Self {
+            config,
+            state: PlaybackState::Stopped,
+            ring_buffer,
+            stats,
+            output: None,
+            decoder_thread: None,
+            decoder_state,
+            current_info: None,
+            current_format: None,
+        }
+    }
+
+    /// 加载并播放文件
+    pub fn play<P: AsRef<Path>>(&mut self, path: P) -> Result<(), EngineError> {
+        // 如果正在播放，先停止
+        if self.state != PlaybackState::Stopped {
+            self.stop()?;
+        }
+
+        let path = path.as_ref();
+        log::info!("Loading: {}", path.display());
+
+        // 打开解码器
+        let decoder = AudioDecoder::open(path)?;
+        let info = decoder.info().clone();
+
+        log::info!(
+            "Format: {} | Codec: {} | {}Hz {}ch {}bit | Duration: {:.1}s",
+            info.format,
+            info.codec,
+            info.sample_rate,
+            info.channels,
+            info.bit_depth.unwrap_or(0),
+            info.duration_secs.unwrap_or(0.0)
+        );
+
+        // 创建音频格式
+        let bit_depth = info.bit_depth.unwrap_or(24) as u16;
+        let format = AudioFormat::new(info.sample_rate, info.channels as u16, bit_depth);
+
+        // 配置输出采样率匹配源文件
+        let mut output_config = self.config.output.clone();
+        output_config.sample_rate = info.sample_rate;
+
+        // 创建输出
+        let mut output = AudioOutput::new(output_config)?;
+
+        // 清空缓冲区
+        self.ring_buffer.clear();
+        self.stats.reset();
+
+        // 启动输出
+        output.start(
+            format,
+            Arc::clone(&self.ring_buffer),
+            Arc::clone(&self.stats),
+        )?;
+
+        // 启动解码线程
+        self.decoder_state.running.store(true, Ordering::Release);
+        self.decoder_state.paused.store(false, Ordering::Release);
+        self.decoder_state
+            .samples_decoded
+            .store(0, Ordering::Release);
+
+        let decoder_state = Arc::clone(&self.decoder_state);
+        let ring_buffer = Arc::clone(&self.ring_buffer);
+        let prebuffer_ratio = self.config.prebuffer_ratio;
+        let channels = info.channels as usize;
+
+        let decoder_thread = thread::Builder::new()
+            .name("decoder".to_string())
+            .spawn(move || {
+                Self::decoder_thread_main(
+                    decoder,
+                    ring_buffer,
+                    decoder_state,
+                    prebuffer_ratio,
+                    channels,
+                );
+            })
+            .expect("Failed to spawn decoder thread");
+
+        self.output = Some(output);
+        self.decoder_thread = Some(decoder_thread);
+        self.current_info = Some(info);
+        self.current_format = Some(format);
+        self.state = PlaybackState::Buffering;
+
+        Ok(())
+    }
+
+    /// 解码线程主函数
+    ///
+    /// 使用整数直通路径：对于整数源格式，避免 f64 中间转换
+    fn decoder_thread_main(
+        decoder: AudioDecoder,
+        ring_buffer: Arc<RingBuffer<i32>>,
+        state: Arc<DecoderState>,
+        prebuffer_ratio: f64,
+        channels: usize,
+    ) {
+        // 设置较高的线程优先级（但不是实时，避免影响 CoreAudio IO 线程）
+        Self::set_decoder_thread_priority();
+
+        let mut iter = DecoderIterator::new(decoder);
+
+        // 预缓冲目标
+        let prebuffer_samples = (ring_buffer.capacity() as f64 * prebuffer_ratio) as usize;
+        let mut prebuffered = false;
+
+        // 读取块大小
+        let read_chunk_size = 4096 * channels;
+
+        log::info!(
+            "Decoder thread started (integer passthrough), prebuffer target: {} samples",
+            prebuffer_samples
+        );
+
+        while state.running.load(Ordering::Acquire) {
+            // 检查暂停 - 使用 Condvar 等待，响应延迟 ~0
+            if state.paused.load(Ordering::Acquire) {
+                let guard = state.pause_mutex.lock().unwrap();
+                // 再次检查，避免丢失通知
+                if state.paused.load(Ordering::Acquire) && state.running.load(Ordering::Acquire) {
+                    // 使用带超时的 wait，以便定期检查 running 状态
+                    let _ = state.pause_cond.wait_timeout(guard, std::time::Duration::from_millis(100));
+                }
+                continue;
+            }
+
+            // 检查缓冲区是否有空间
+            let available_write = ring_buffer.free_space();
+
+            if available_write < 1024 * channels {
+                // 缓冲区快满了 - 使用 spin + yield 策略
+                // 先自旋几次（适合非常短的等待）
+                for _ in 0..32 {
+                    std::hint::spin_loop();
+                }
+                // 然后 yield 让出 CPU
+                thread::yield_now();
+                // 最后短暂睡眠（1ms，比之前的 5ms 减少 80%）
+                thread::sleep(std::time::Duration::from_millis(1));
+                continue;
+            }
+
+            // 解码（整数直通路径）
+            // 对于 PCM 整数源，直接转换到 i32，避免 f64 中间表示
+            let samples_to_read = available_write.min(read_chunk_size);
+            match iter.read_i32(samples_to_read) {
+                Ok(samples) => {
+                    if samples.is_empty() {
+                        // EOF
+                        log::info!("Decoder reached end of file");
+                        break;
+                    }
+
+                    // 写入 ring buffer（样本已经是 i32 左对齐格式）
+                    let samples_written = ring_buffer.write(samples);
+                    state
+                        .samples_decoded
+                        .fetch_add(samples_written as u64, Ordering::Relaxed);
+
+                    // 检查预缓冲是否完成
+                    if !prebuffered && ring_buffer.available() >= prebuffer_samples {
+                        prebuffered = true;
+                        log::info!("Prebuffer complete");
+                    }
+                }
+                Err(e) => {
+                    log::error!("Decode error: {}", e);
+                    break;
+                }
+            }
+        }
+
+        log::info!("Decoder thread finished");
+    }
+
+    /// 设置解码线程优先级
+    ///
+    /// 使用 pthread 设置较高优先级，但保持低于 CoreAudio IO 线程
+    fn set_decoder_thread_priority() {
+        #[cfg(target_os = "macos")]
+        {
+            use libc::{pthread_self, pthread_setschedparam, sched_param, SCHED_RR};
+
+            unsafe {
+                let thread = pthread_self();
+                let mut param: sched_param = std::mem::zeroed();
+                // 使用较高优先级（但不是最高，避免影响 IO 线程）
+                // SCHED_RR 的优先级范围通常是 1-99
+                param.sched_priority = 47;
+
+                let result = pthread_setschedparam(thread, SCHED_RR, &param);
+                if result == 0 {
+                    log::debug!("Decoder thread priority set to SCHED_RR:47");
+                } else {
+                    // 如果失败（通常需要 root 权限），尝试提升到最高普通优先级
+                    log::debug!(
+                        "Failed to set realtime priority (errno: {}), falling back to nice",
+                        result
+                    );
+                    // 设置 nice 值为 -10（较高优先级）
+                    libc::setpriority(libc::PRIO_PROCESS, 0, -10);
+                }
+            }
+        }
+    }
+
+    /// 停止播放
+    pub fn stop(&mut self) -> Result<(), EngineError> {
+        // 停止解码线程
+        self.decoder_state.running.store(false, Ordering::Release);
+        // 唤醒可能在等待的解码线程
+        self.decoder_state.pause_cond.notify_one();
+
+        if let Some(thread) = self.decoder_thread.take() {
+            let _ = thread.join();
+        }
+
+        // 停止输出
+        if let Some(mut output) = self.output.take() {
+            output.stop()?;
+        }
+
+        self.ring_buffer.clear();
+        self.state = PlaybackState::Stopped;
+        self.current_info = None;
+        self.current_format = None;
+
+        log::info!("Playback stopped");
+
+        Ok(())
+    }
+
+    /// 暂停/恢复
+    pub fn toggle_pause(&mut self) -> Result<(), EngineError> {
+        match self.state {
+            PlaybackState::Playing => {
+                self.decoder_state.paused.store(true, Ordering::Release);
+                self.state = PlaybackState::Paused;
+                log::info!("Paused");
+            }
+            PlaybackState::Paused | PlaybackState::Buffering => {
+                self.decoder_state.paused.store(false, Ordering::Release);
+                // 通知解码线程恢复 - 响应延迟从 ~10ms 降到 ~0
+                self.decoder_state.pause_cond.notify_one();
+                self.state = PlaybackState::Playing;
+                log::info!("Resumed");
+            }
+            PlaybackState::Stopped => {
+                return Err(EngineError::InvalidState("Cannot pause when stopped"));
+            }
+        }
+        Ok(())
+    }
+
+    /// 获取当前状态
+    pub fn state(&self) -> PlaybackState {
+        // 检查是否从 Buffering 转为 Playing
+        if self.state == PlaybackState::Buffering {
+            let fill_ratio = self.ring_buffer.fill_ratio();
+            if fill_ratio >= self.config.prebuffer_ratio {
+                return PlaybackState::Playing;
+            }
+        }
+        self.state
+    }
+
+    /// 获取统计信息
+    pub fn stats(&self) -> EngineStats {
+        let buffer_fill_ratio = self.ring_buffer.fill_ratio();
+        let underrun_count = self.stats.underrun_count();
+        let samples_played = self.stats.samples_played();
+        let sample_rate = self
+            .current_info
+            .as_ref()
+            .map(|i| i.sample_rate)
+            .unwrap_or(48000);
+        let channels = self.current_info.as_ref().map(|i| i.channels).unwrap_or(2);
+        let frames_played = samples_played / channels as u64;
+        let position_secs = frames_played as f64 / sample_rate as f64;
+
+        EngineStats {
+            buffer_fill_ratio,
+            underrun_count,
+            samples_played,
+            position_secs,
+        }
+    }
+
+    /// 获取详细统计报告
+    pub fn stats_report(&self) -> Option<crate::audio::StatsReport> {
+        let info = self.current_info.as_ref()?;
+        let buffer_frames = self.config.output.buffer_frames;
+        Some(self.stats.report(buffer_frames, info.sample_rate))
+    }
+
+    /// 获取当前文件信息
+    pub fn current_info(&self) -> Option<&AudioInfo> {
+        self.current_info.as_ref()
+    }
+
+    /// 检查是否正在播放
+    pub fn is_playing(&self) -> bool {
+        matches!(
+            self.state(),
+            PlaybackState::Playing | PlaybackState::Buffering
+        )
+    }
+}
+
+impl Drop for Engine {
+    fn drop(&mut self) {
+        let _ = self.stop();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_engine_config_default() {
+        let config = EngineConfig::default();
+        assert_eq!(config.buffer_frames, 48000 * 2 * 2);
+        assert_eq!(config.prebuffer_ratio, 0.5);
+    }
+}

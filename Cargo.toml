@@ -1,0 +1,43 @@
+[package]
+name = "hifi-replayer"
+version = "0.1.0"
+edition = "2021"
+description = "High-fidelity audio player focused on timing stability and bit-perfect output"
+
+[dependencies]
+# Audio decoding
+symphonia = { version = "0.5", features = ["flac", "pcm", "wav", "aiff", "mp3"] }
+
+# Lock-free data structures
+crossbeam-utils = "0.8"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Logging (non-blocking for realtime safety)
+log = "0.4"
+env_logger = "0.11"
+
+# Error handling
+thiserror = "1"
+anyhow = "1"
+
+# Signal handling
+ctrlc = "3"
+
+# System calls
+libc = "0.2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# Core Audio bindings
+coreaudio-sys = "0.2"
+core-foundation = "0.9"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+
+[profile.dev]
+opt-level = 1  # Some optimization even in debug for audio performance
