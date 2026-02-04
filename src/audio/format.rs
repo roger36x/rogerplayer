@@ -6,18 +6,13 @@
 //! - 32-bit: 占据 bit[31:0]
 
 /// 输出布局
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum OutputLayout {
     /// 交织：LRLRLR...，所有样本在 mBuffers[0]
+    #[default]
     Interleaved,
     /// 非交织：每声道独立 buffer，mBuffers[0]=L, mBuffers[1]=R
     NonInterleaved,
-}
-
-impl Default for OutputLayout {
-    fn default() -> Self {
-        Self::Interleaved
-    }
 }
 
 /// 音频格式

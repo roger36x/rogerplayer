@@ -30,7 +30,7 @@
 │ - symphonia 解码   │  Lock-free   │ - THREAD_TIME_CONSTRAINT      │
 │ - i32 左对齐转换   │ ──────────→  │ - 零拷贝/格式转换              │
 │ - SIMD 加速       │  Ring Buffer │ - TPDF Dither (Float32)       │
-│ - 普通优先级      │   (SPSC)     │ - 实时优先级                   │
+│                   │   (SPSC)     │ - 实时优先级                   │
 └───────────────────┘              └───────────────────────────────┘
 ```
 
@@ -39,6 +39,7 @@
 1. **解码和输出完全解耦** - 通过 lock-free ring buffer 连接，互不阻塞
 2. **IO 回调中禁止**：内存分配、加锁、系统调用、日志
 3. **数据格式统一** - 全程使用 i32 左对齐，避免多次转换
+4. **SRC 由 CoreAudio 处理** - 当源采样率与设备不匹配时，使用 CoreAudio 内置 SRC
 
 ---
 
@@ -110,6 +111,7 @@ pub struct RingBuffer<T: Copy + Default> {
 - **Hog Mode**: 独占设备，防止其他应用干扰
 - **采样率智能选择**: 精确匹配 > 整数分频 > 最近值
 - **IO 线程实时调度**: `THREAD_TIME_CONSTRAINT_POLICY`
+- **CoreAudio SRC**: 当源采样率与设备不匹配时，由 CoreAudio 自动处理采样率转换
 
 **回调函数 (`render_callback`)**：
 ```rust
@@ -176,6 +178,11 @@ Stopped ──play()──→ Buffering ──prebuffer完成──→ Playing
 - 使用 `Condvar` 实现零延迟唤醒
 - 解码线程在暂停时等待，不消耗 CPU
 
+**SRC 处理**：
+- 当源采样率与设备采样率不匹配时，由 CoreAudio 内置 SRC 处理
+- 解码线程直接写入源采样率数据到 ring buffer
+- CoreAudio 自动转换到设备采样率
+
 ### 5. 统计模块 (`audio/stats.rs`)
 
 **职责**：实时采集性能数据，最小化回调开销
@@ -217,6 +224,7 @@ Stopped ──play()──→ Buffering ──prebuffer完成──→ Playing
 | i32 左对齐统一格式 | 全局 | 全程 i32 左对齐，避免多次转换 |
 | Hog Mode | `output.rs` | 独占设备，防止系统混音器干扰 |
 | 采样率智能选择 | `output.rs` | 精确匹配 > 整数分频 > 最近值 |
+| CoreAudio SRC | 系统内置 | 高质量采样率转换，由 CoreAudio 处理 |
 
 ### 性能优化
 
@@ -301,20 +309,11 @@ callback_count.fetch_add(1, Ordering::Relaxed);
 
 ### 已规划（readme.md）
 
-- [ ] 可插拔重采样算法
 - [ ] A/B 对比切换
-- [ ] 自定义 Sinc 滤波器
 - [ ] 播放列表支持
 - [ ] DSD 支持
 
 ### 架构建议
-
-**添加重采样**：
-```
-Decoder → [Resampler] → Ring Buffer → Output
-              ↑
-         可选模块，仅在采样率不匹配时启用
-```
 
 **添加播放列表**：
 ```
@@ -360,7 +359,7 @@ cargo test -- --ignored
 |-------|------|
 | symphonia | 音频解码（FLAC/WAV/AIFF/MP3） |
 | clap | 命令行参数解析 |
-| log + flexi_logger | 非阻塞日志 |
+| log + env_logger | 非阻塞日志 |
 | libc | 系统调用（mlock, pthread） |
 | crossbeam-utils | 并发工具 |
 

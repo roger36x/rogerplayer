@@ -101,6 +101,7 @@ impl AudioStreamBasicDescription {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy, Default)]
 struct AudioValueRange {
     minimum: f64,
     maximum: f64,
@@ -455,7 +456,7 @@ mod thread_policy {
     pub fn ns_to_ticks(ns: u64) -> u32 {
         let (numer, denom) = get_timebase_info();
         // ticks = ns * denom / numer
-        ((ns as u64 * denom as u64) / numer as u64) as u32
+        ((ns * denom as u64) / numer as u64) as u32
     }
 }
 
@@ -833,10 +834,7 @@ impl AudioOutput {
         }
 
         let count = size as usize / std::mem::size_of::<AudioValueRange>();
-        let mut ranges: Vec<AudioValueRange> = Vec::with_capacity(count);
-        unsafe {
-            ranges.set_len(count);
-        }
+        let mut ranges: Vec<AudioValueRange> = vec![AudioValueRange::default(); count];
 
         let status = unsafe {
             AudioObjectGetPropertyData(
@@ -992,11 +990,8 @@ impl AudioOutput {
 
         for &rate in supported {
             let diff = (rate - requested).abs();
-            // 优先选择大于等于请求的采样率
-            if rate >= requested && diff < best_diff {
-                best = rate;
-                best_diff = diff;
-            } else if rate < requested && best < requested && diff < best_diff {
+            // 优先选择大于等于请求的采样率，否则选最接近的
+            if diff < best_diff && (rate >= requested || best < requested) {
                 best = rate;
                 best_diff = diff;
             }
@@ -1040,6 +1035,16 @@ impl AudioOutput {
     ///
     /// 设置后验证采样率是否正确切换，最多重试 3 次
     fn set_sample_rate(device_id: AudioDeviceID, rate: f64) -> Result<(), OutputError> {
+        const TOLERANCE: f64 = 1.0; // 允许 1Hz 误差
+
+        // 先检查当前采样率是否已经正确，避免不必要的设置操作
+        if let Ok(current_rate) = Self::get_current_sample_rate(device_id) {
+            if (current_rate - rate).abs() < TOLERANCE {
+                log::debug!("Sample rate already at {} Hz, skipping set", current_rate);
+                return Ok(());
+            }
+        }
+
         let address = AudioObjectPropertyAddress {
             selector: K_AUDIO_DEVICE_PROPERTY_NOMINAL_SAMPLE_RATE,
             scope: K_AUDIO_OBJECT_PROPERTY_SCOPE_OUTPUT,
@@ -1090,7 +1095,6 @@ impl AudioOutput {
         // 验证采样率切换是否成功（带重试）
         const MAX_RETRIES: u32 = 10;
         const RETRY_DELAY_MS: u64 = 20;
-        const TOLERANCE: f64 = 1.0; // 允许 1Hz 误差
 
         for attempt in 0..MAX_RETRIES {
             std::thread::sleep(std::time::Duration::from_millis(RETRY_DELAY_MS));
@@ -1467,7 +1471,11 @@ impl AudioOutput {
     ///
     /// 这是最直接的信号路径，绕过所有格式转换。
     /// 需要设备支持，返回成功与否和实际使用的格式。
-    fn try_set_physical_format(&self, format: &AudioFormat) -> Option<(AudioStreamBasicDescription, OutputFormatMode)> {
+    ///
+    /// # Arguments
+    /// * `format` - 音频格式（声道数等）
+    /// * `device_sample_rate` - 设备实际采样率（由 set_sample_rate_smart 确定）
+    fn try_set_physical_format(&self, format: &AudioFormat, device_sample_rate: u32) -> Option<(AudioStreamBasicDescription, OutputFormatMode)> {
         // 获取输出流 ID
         let stream_id = Self::get_output_stream_id(self.device_id)?;
         log::info!("Output stream ID: {}", stream_id);
@@ -1483,9 +1491,9 @@ impl AudioOutput {
             );
         }
 
-        // 尝试设置 32-bit 整数物理格式
+        // 尝试设置 32-bit 整数物理格式（使用设备实际采样率）
         let asbd_int32 = AudioStreamBasicDescription {
-            sample_rate: format.sample_rate as f64,
+            sample_rate: device_sample_rate as f64,
             format_id: K_AUDIO_FORMAT_LINEAR_PCM,
             format_flags: K_AUDIO_FORMAT_FLAG_IS_SIGNED_INTEGER | K_AUDIO_FORMAT_FLAG_IS_PACKED,
             bytes_per_packet: 4 * format.channels as u32,
@@ -1508,9 +1516,9 @@ impl AudioOutput {
             }
         }
 
-        // 尝试 24-bit 整数
+        // 尝试 24-bit 整数（使用设备实际采样率）
         let asbd_int24 = AudioStreamBasicDescription {
-            sample_rate: format.sample_rate as f64,
+            sample_rate: device_sample_rate as f64,
             format_id: K_AUDIO_FORMAT_LINEAR_PCM,
             format_flags: K_AUDIO_FORMAT_FLAG_IS_SIGNED_INTEGER | K_AUDIO_FORMAT_FLAG_IS_PACKED,
             bytes_per_packet: 3 * format.channels as u32,
@@ -1538,8 +1546,13 @@ impl AudioOutput {
     ///
     /// 整数格式避免了 i32 → f32 的转换，信号路径更直接。
     /// 返回 (成功与否, 输出格式模式)
+    ///
+    /// # Arguments
+    /// * `format` - 音频格式（包含源文件采样率）
+    ///
+    /// 注意：Input scope 使用源文件采样率，CoreAudio 会自动做 SRC 到设备采样率
     fn try_set_integer_format(&self, format: &AudioFormat) -> (bool, OutputFormatMode) {
-        // 优先尝试 32-bit Integer
+        // 优先尝试 32-bit Integer（使用源文件采样率，CoreAudio 会做 SRC）
         let asbd_int32 = AudioStreamBasicDescription {
             sample_rate: format.sample_rate as f64,
             format_id: K_AUDIO_FORMAT_LINEAR_PCM,
@@ -1568,7 +1581,7 @@ impl AudioOutput {
             return (true, OutputFormatMode::Int32);
         }
 
-        // 尝试 24-bit Integer (packed)
+        // 尝试 24-bit Integer (packed)（使用源文件采样率）
         let asbd_int24 = AudioStreamBasicDescription {
             sample_rate: format.sample_rate as f64,
             format_id: K_AUDIO_FORMAT_LINEAR_PCM,
@@ -1670,46 +1683,13 @@ impl AudioOutput {
         let _ = status;
 
         // 尝试设置流格式
-        // 优先级：Physical Format (直接硬件) > ASBD Integer > Float32
-        let output_mode = if self.config.integer_mode && self.device_id != 0 {
-            // 首先尝试物理格式（最直接的硬件访问路径）
-            if let Some((_, mode)) = self.try_set_physical_format(&format) {
-                mode
-            } else {
-                // 回退到 ASBD 格式
-                let (success, mode) = self.try_set_integer_format(&format);
-                if success {
-                    mode
-                } else {
-                    // 回退到 Float32
-                    let asbd = AudioStreamBasicDescription {
-                        sample_rate: format.sample_rate as f64,
-                        format_id: K_AUDIO_FORMAT_LINEAR_PCM,
-                        format_flags: K_AUDIO_FORMAT_FLAG_IS_FLOAT | K_AUDIO_FORMAT_FLAG_IS_PACKED,
-                        bytes_per_packet: 4 * format.channels as u32,
-                        frames_per_packet: 1,
-                        bytes_per_frame: 4 * format.channels as u32,
-                        channels_per_frame: format.channels as u32,
-                        bits_per_channel: 32,
-                        reserved: 0,
-                    };
+        // 优先级：Physical Format (直接硬件，仅当不需要 SRC 时) > ASBD Integer > Float32
+        // Input scope 使用源文件采样率，CoreAudio 会自动做 SRC 到设备采样率
+        let device_sample_rate = self.config.sample_rate;
+        let needs_src = format.sample_rate != device_sample_rate;
 
-                    let status = unsafe {
-                        AudioUnitSetProperty(
-                            self.audio_unit,
-                            K_AUDIO_UNIT_PROPERTY_STREAM_FORMAT,
-                            K_AUDIO_UNIT_SCOPE_INPUT,
-                            0,
-                            &asbd as *const _ as *const c_void,
-                            std::mem::size_of::<AudioStreamBasicDescription>() as u32,
-                        )
-                    };
-                    let _ = status;
-                    OutputFormatMode::Float32
-                }
-            }
-        } else {
-            // DefaultOutput 使用 Float32
+        // 辅助函数：设置 Float32 格式
+        let set_float32_format = |audio_unit, format: &AudioFormat| {
             let asbd = AudioStreamBasicDescription {
                 sample_rate: format.sample_rate as f64,
                 format_id: K_AUDIO_FORMAT_LINEAR_PCM,
@@ -1721,18 +1701,42 @@ impl AudioOutput {
                 bits_per_channel: 32,
                 reserved: 0,
             };
-
-            let status = unsafe {
+            unsafe {
                 AudioUnitSetProperty(
-                    self.audio_unit,
+                    audio_unit,
                     K_AUDIO_UNIT_PROPERTY_STREAM_FORMAT,
                     K_AUDIO_UNIT_SCOPE_INPUT,
                     0,
                     &asbd as *const _ as *const c_void,
                     std::mem::size_of::<AudioStreamBasicDescription>() as u32,
                 )
+            }
+        };
+
+        let output_mode = if self.config.integer_mode && self.device_id != 0 {
+            // 只有不需要 SRC 时才尝试物理格式（直接硬件访问，绕过 SRC）
+            let physical_mode = if !needs_src {
+                self.try_set_physical_format(&format, device_sample_rate).map(|(_, mode)| mode)
+            } else {
+                log::info!("SRC required ({}Hz → {}Hz), skipping physical format", format.sample_rate, device_sample_rate);
+                None
             };
-            let _ = status;
+
+            if let Some(mode) = physical_mode {
+                mode
+            } else {
+                // 回退到 ASBD 格式（Integer 或 Float32）
+                let (success, mode) = self.try_set_integer_format(&format);
+                if success {
+                    mode
+                } else {
+                    let _ = set_float32_format(self.audio_unit, &format);
+                    OutputFormatMode::Float32
+                }
+            }
+        } else {
+            // DefaultOutput 使用 Float32
+            let _ = set_float32_format(self.audio_unit, &format);
             OutputFormatMode::Float32
         };
 
@@ -1752,9 +1756,9 @@ impl AudioOutput {
         // 预分配 sample_buffer（足够大以处理任何 callback）
         let sample_buffer = vec![0i32; max_samples_per_callback];
 
-        // 保存实际格式
+        // 保存实际格式（使用设备实际采样率，而非源文件采样率）
         self.actual_format = AudioFormat {
-            sample_rate: format.sample_rate,
+            sample_rate: device_sample_rate,
             channels: format.channels,
             bits_per_sample: format.bits_per_sample,
             layout: output_layout,
@@ -1823,8 +1827,17 @@ impl AudioOutput {
             return Err(OutputError::AudioUnitFailed(status));
         }
 
+        // 如果源采样率与设备采样率不同，记录警告
+        if format.sample_rate != device_sample_rate {
+            log::warn!(
+                "Sample rate conversion: source {}Hz → device {}Hz (CoreAudio SRC)",
+                format.sample_rate,
+                device_sample_rate
+            );
+        }
+
         log::info!(
-            "Audio output started: {}Hz, {} channels, {}bit, {:?}, mode={:?}",
+            "Audio output started: {}Hz (device), {} channels, {}bit, {:?}, mode={:?}",
             self.actual_format.sample_rate,
             self.actual_format.channels,
             self.actual_format.bits_per_sample,
@@ -1852,8 +1865,10 @@ impl AudioOutput {
             self.hog_mode_acquired = false;
         }
 
-        // 恢复原始采样率
-        let _ = Self::set_sample_rate(self.device_id, self.original_sample_rate);
+        // 恢复原始采样率（仅 HALOutput 需要，DefaultOutput 的 device_id 为 0）
+        if self.device_id != 0 {
+            let _ = Self::set_sample_rate(self.device_id, self.original_sample_rate);
+        }
 
         self.context = None;
 
@@ -1872,6 +1887,33 @@ impl AudioOutput {
     /// 获取实际格式
     pub fn actual_format(&self) -> AudioFormat {
         self.actual_format
+    }
+
+    /// 是否使用 HALOutput（直接硬件访问）
+    pub fn is_hal_output(&self) -> bool {
+        self.is_hal_output
+    }
+
+    /// 是否已获取独占模式
+    pub fn is_exclusive_mode(&self) -> bool {
+        self.hog_mode_acquired
+    }
+
+    /// 获取设备 ID
+    pub fn device_id(&self) -> u32 {
+        self.device_id
+    }
+
+    /// 获取目标采样率
+    ///
+    /// 根据请求的采样率和设备支持的采样率，返回实际会使用的采样率。
+    /// 用于在 start() 之前决定是否需要外部 SRC。
+    pub fn target_sample_rate(&self, requested_rate: u32) -> u32 {
+        if self.supported_sample_rates.is_empty() {
+            // DefaultOutput 或无法查询的设备，假设支持请求的采样率
+            return requested_rate;
+        }
+        Self::select_optimal_sample_rate(requested_rate as f64, &self.supported_sample_rates) as u32
     }
 }
 

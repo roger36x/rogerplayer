@@ -59,7 +59,7 @@ impl PlaybackStats {
         let count = self.callback_count.fetch_add(1, Ordering::Relaxed);
 
         // 只在采样点才做额外工作
-        if count % SAMPLE_INTERVAL == 0 {
+        if count.is_multiple_of(SAMPLE_INTERVAL) {
             // 使用硬件时间戳（更精确）或回退到 now_ticks()
             let now = if host_time > 0 { host_time } else { now_ticks() };
             let last = self.last_sampled_ticks.swap(now, Ordering::Relaxed);

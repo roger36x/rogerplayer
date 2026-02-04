@@ -28,6 +28,9 @@ ctrlc = "3"
 # System calls
 libc = "0.2"
 
+# Random (for shuffle)
+rand = "0.8"
+
 [target.'cfg(target_os = "macos")'.dependencies]
 # Core Audio bindings
 coreaudio-sys = "0.2"

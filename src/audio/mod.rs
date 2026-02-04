@@ -13,8 +13,7 @@ pub mod ring_buffer;
 pub mod stats;
 pub mod timing;
 
-pub use format::{AudioFormat, OutputLayout};
-pub use output::{AudioOutput, DeviceInfo, OutputConfig, OutputError};
-pub use ring_buffer::{CacheLine, RingBuffer};
+pub use format::AudioFormat;
+pub use output::{AudioOutput, OutputConfig, OutputError};
+pub use ring_buffer::RingBuffer;
 pub use stats::{PlaybackStats, StatsReport};
-pub use timing::{mach_ticks_to_ns, now_ns, now_ticks};

@@ -51,7 +51,6 @@ pub enum EngineError {
     DecodeError(crate::decode::DecodeError),
     OutputError(crate::audio::OutputError),
     InvalidState(&'static str),
-    SampleRateMismatch { source: u32, output: u32 },
 }
 
 impl std::fmt::Display for EngineError {
@@ -60,13 +59,6 @@ impl std::fmt::Display for EngineError {
             Self::DecodeError(e) => write!(f, "Decode error: {}", e),
             Self::OutputError(e) => write!(f, "Output error: {}", e),
             Self::InvalidState(s) => write!(f, "Invalid state: {}", s),
-            Self::SampleRateMismatch { source, output } => {
-                write!(
-                    f,
-                    "Sample rate mismatch: source {}Hz, output {}Hz",
-                    source, output
-                )
-            }
         }
     }
 }
@@ -104,6 +96,8 @@ struct DecoderState {
     running: AtomicBool,
     /// 是否暂停解码
     paused: AtomicBool,
+    /// 解码是否已到达 EOF
+    eof_reached: AtomicBool,
     /// 已解码样本数
     samples_decoded: AtomicU64,
     /// 用于暂停/恢复通知的 Condvar
@@ -135,6 +129,7 @@ impl Engine {
         let decoder_state = Arc::new(DecoderState {
             running: AtomicBool::new(false),
             paused: AtomicBool::new(false),
+            eof_reached: AtomicBool::new(false),
             samples_decoded: AtomicU64::new(0),
             pause_cond: Condvar::new(),
             pause_mutex: Mutex::new(()),
@@ -179,14 +174,28 @@ impl Engine {
 
         // 创建音频格式
         let bit_depth = info.bit_depth.unwrap_or(24) as u16;
-        let format = AudioFormat::new(info.sample_rate, info.channels as u16, bit_depth);
+        let source_sample_rate = info.sample_rate;
 
-        // 配置输出采样率匹配源文件
+        // 配置输出采样率为源文件采样率（作为请求）
         let mut output_config = self.config.output.clone();
-        output_config.sample_rate = info.sample_rate;
+        output_config.sample_rate = source_sample_rate;
 
         // 创建输出
         let mut output = AudioOutput::new(output_config)?;
+
+        // 查询设备实际采样率
+        let device_sample_rate = output.target_sample_rate(source_sample_rate);
+        let needs_src = source_sample_rate != device_sample_rate;
+
+        // 使用 CoreAudio 内置 SRC
+        // ring buffer 中的数据是 source rate，CoreAudio 会自动转换到 device rate
+        if needs_src {
+            log::info!(
+                "CoreAudio SRC: {}Hz → {}Hz",
+                source_sample_rate, device_sample_rate
+            );
+        }
+        let format = AudioFormat::new(source_sample_rate, info.channels as u16, bit_depth);
 
         // 清空缓冲区
         self.ring_buffer.clear();
@@ -202,6 +211,7 @@ impl Engine {
         // 启动解码线程
         self.decoder_state.running.store(true, Ordering::Release);
         self.decoder_state.paused.store(false, Ordering::Release);
+        self.decoder_state.eof_reached.store(false, Ordering::Release);
         self.decoder_state
             .samples_decoded
             .store(0, Ordering::Release);
@@ -236,6 +246,7 @@ impl Engine {
     /// 解码线程主函数
     ///
     /// 使用整数直通路径：对于整数源格式，避免 f64 中间转换
+    /// SRC 由 CoreAudio 内部处理
     fn decoder_thread_main(
         decoder: AudioDecoder,
         ring_buffer: Arc<RingBuffer<i32>>,
@@ -256,7 +267,7 @@ impl Engine {
         let read_chunk_size = 4096 * channels;
 
         log::info!(
-            "Decoder thread started (integer passthrough), prebuffer target: {} samples",
+            "Decoder thread started, prebuffer target: {} samples",
             prebuffer_samples
         );
 
@@ -294,13 +305,15 @@ impl Engine {
             match iter.read_i32(samples_to_read) {
                 Ok(samples) => {
                     if samples.is_empty() {
-                        // EOF
+                        // EOF - 设置标志，让上层知道解码已完成
+                        state.eof_reached.store(true, Ordering::Release);
                         log::info!("Decoder reached end of file");
                         break;
                     }
 
-                    // 写入 ring buffer（样本已经是 i32 左对齐格式）
+                    // 直接写入 ring buffer（SRC 由 CoreAudio 处理）
                     let samples_written = ring_buffer.write(samples);
+
                     state
                         .samples_decoded
                         .fetch_add(samples_written as u64, Ordering::Relaxed);
@@ -452,6 +465,21 @@ impl Engine {
             self.state(),
             PlaybackState::Playing | PlaybackState::Buffering
         )
+    }
+
+    /// 检查当前音轨是否已播放完毕
+    ///
+    /// 条件：解码到达 EOF 且缓冲区已被消费完
+    pub fn is_track_finished(&self) -> bool {
+        self.decoder_state.eof_reached.load(Ordering::Acquire)
+            && self.ring_buffer.available() == 0
+    }
+
+    /// 获取输出模式信息
+    ///
+    /// 返回 (是否为HAL直接输出, 是否为独占模式)
+    pub fn output_mode(&self) -> Option<(bool, bool)> {
+        self.output.as_ref().map(|o| (o.is_hal_output(), o.is_exclusive_mode()))
     }
 }
 
