@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(rustc:*)",
+      "Bash(cargo:*)",
+      "Bash(curl:*)",
+      "Bash(sh -s -- -y)",
+      "Bash(source \"$HOME/.cargo/env\")",
+      "Bash(node --version:*)",
+      "Bash(rustup target list:*)",
+      "Bash(~/.cargo/bin/rustup target list:*)",
+      "Bash(~/.cargo/bin/rustup target add:*)",
+      "Bash(~/.cargo/bin/cargo build:*)",
+      "Bash(otool:*)"
+    ]
+  }
+}

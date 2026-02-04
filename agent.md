@@ -1,4 +1,4 @@
-# HiFi Replayer - 技术文档
+# Roger Player - 技术文档
 
 > 本文档面向 AI Agent 和开发者，说明项目架构、设计决策和开发注意事项。
 
@@ -51,11 +51,11 @@ src/
 ├── main.rs             # CLI 入口
 ├── audio/
 │   ├── mod.rs          # 音频模块导出
-│   ├── output.rs       # CoreAudio 输出 (HALOutput/DefaultOutput)
+│   ├── output.rs       # CoreAudio 输出 (HALOutput/DefaultOutput + TPDF dither)
 │   ├── ring_buffer.rs  # Lock-free SPSC 环形缓冲区
 │   ├── stats.rs        # 实时统计（降频采样）
-│   ├── format.rs       # 音频格式定义
-│   └── dither.rs       # TPDF 抖动实现
+│   ├── format.rs       # 音频格式定义和样本转换
+│   └── timing.rs       # Mach 时间相关函数 (timebase 转换)
 ├── decode/
 │   ├── mod.rs          # 解码模块导出
 │   └── decoder.rs      # symphonia 解码器封装
@@ -100,28 +100,28 @@ pub struct RingBuffer<T: Copy + Default> {
 **职责**：CoreAudio 设备管理和音频输出
 
 **后端优先级**：
-1. **IOProc** - 直接 HAL 层回调，绕过 AudioUnit，最短信号路径
-2. **HALOutput AudioUnit** - 绕过系统混音器，直接访问 USB DAC
-3. **DefaultOutput** - 通过系统混音器，用于蓝牙等设备
+1. **HALOutput AudioUnit** - 绕过系统混音器，直接访问硬件设备（有线/USB）
+2. **DefaultOutput AudioUnit** - 通过系统混音器，用于蓝牙等设备
 
-**输出格式优先级**：
+**输出格式优先级**（HALOutput 模式）：
 1. **Physical Format (Int32)** - 直接硬件访问，bit-perfect
 2. **ASBD Integer (Int32/Int24)** - 通过 AudioUnit 整数输出
-3. **Float32 + TPDF Dither** - 回退路径
+3. **Float32 + TPDF Dither** - 回退路径（DefaultOutput 默认使用）
 
 **关键技术**：
-- **IOProc vs AudioUnit**
-  - IOProc: `App → HAL → Hardware`（最短路径，延迟更低）
-  - AudioUnit: `App → AudioUnit → HAL → Hardware`
-- **Hog Mode**: 独占设备，防止其他应用干扰
+- **AudioUnit 后端选择**
+  - HALOutput: 直接硬件访问，绕过系统混音器，最佳音质
+  - DefaultOutput: 通过系统混音器，兼容蓝牙设备
+- **Hog Mode**: 独占设备，防止其他应用干扰（HALOutput 模式）
 - **采样率智能选择**: 精确匹配 > 整数分频 > 最近值
-- **IO 线程实时调度**: `THREAD_TIME_CONSTRAINT_POLICY`
+- **IO 线程实时调度**: `THREAD_TIME_CONSTRAINT_POLICY`（首次回调时设置）
 - **设备能力查询**: buffer size range, latency, safety offset
 - **CoreAudio SRC**: 当源采样率与设备不匹配时，由 CoreAudio 自动处理采样率转换
+- **TPDF Dither**: Float32 输出时使用 xorshift32 PRNG 生成三角形分布抖动
 
 **回调函数**：
 ```rust
-// IOProc (直接 HAL) 或 render_callback (AudioUnit) 共享处理逻辑
+// AudioUnit render_callback 处理逻辑
 // 首次调用设置实时线程策略（只执行一次）
 if ctx.thread_policy_set.compare_exchange(...).is_ok() {
     ctx.set_realtime_thread_policy();
@@ -129,10 +129,14 @@ if ctx.thread_policy_set.compare_exchange(...).is_ok() {
 
 // 根据输出模式选择路径
 match ctx.output_mode {
-    Int32 => // 零拷贝：ring_buffer → 输出缓冲区
-    Int24 => // 转换：ring_buffer → sample_buffer → 24-bit packed
+    Int32 => // 零拷贝：ring_buffer → 输出缓冲区直接读取
+    Int24 => // 转换 + dither：ring_buffer → sample_buffer → 24-bit packed + TPDF
     Float32 => // 转换 + dither：ring_buffer → sample_buffer → f32 + TPDF
 }
+
+// 支持 Interleaved 和 NonInterleaved 布局
+// - Interleaved: LRLRLR... 所有样本在 mBuffers[0]
+// - NonInterleaved: L 在 mBuffers[0], R 在 mBuffers[1]
 ```
 
 ### 3. 解码器 (`decode/decoder.rs`)
@@ -204,6 +208,15 @@ Stopped ──play()──→ Buffering ──prebuffer完成──→ Playing
 - Underrun 次数
 - 已播放样本数
 
+### 6. 时间工具 (`audio/timing.rs`)
+
+**职责**：Mach 时间相关转换
+
+**功能**：
+- Mach ticks 到纳秒转换（全局缓存 timebase info）
+- 跨平台时间获取（macOS 使用 `mach_absolute_time`）
+- Intel (1/1 timebase) 和 Apple Silicon (125/3 timebase) 自动适配
+
 ---
 
 ## 性能优化清单
@@ -212,29 +225,30 @@ Stopped ──play()──→ Buffering ──prebuffer完成──→ Playing
 
 | 优化项 | 实现位置 | 说明 |
 |--------|----------|------|
-| **IOProc 直接 HAL 访问** | `output.rs` | 绕过 AudioUnit 层，最短回调路径 |
+| **HALOutput 直接硬件访问** | `output.rs` | 绕过系统混音器，直接访问设备 |
 | Lock-free SPSC Ring Buffer | `ring_buffer.rs` | 生产者/消费者完全无锁，wait-free |
 | CacheLine 对齐 | `ring_buffer.rs` | `#[repr(align(64))]` 避免 false sharing |
 | mlock 内存锁定 | `ring_buffer.rs`, `output.rs` | 防止 page fault 导致时序抖动 |
-| IO 线程实时调度 | `output.rs` | `THREAD_TIME_CONSTRAINT_POLICY` |
+| IO 线程实时调度 | `output.rs` | `THREAD_TIME_CONSTRAINT_POLICY`（首次回调设置） |
 | 设备能力查询 | `output.rs` | 查询 buffer range, latency, safety offset |
 | 解码线程优先级 | `engine/mod.rs` | `SCHED_RR:47` 或 `nice -10` 回退 |
 | 统计降频采样 | `stats.rs` | 每 16 次回调才采样，减少原子操作开销 |
 | Condvar 暂停机制 | `engine/mod.rs` | 零延迟唤醒，避免轮询 |
-| 硬件时间戳 | `stats.rs` | 使用 `AudioTimeStamp.host_time` 提升时序精度 |
+| Mach 时间转换 | `timing.rs` | 高效的 timebase 转换，全局缓存避免重复查询 |
 
 ### Bit-Perfect 信号路径优化
 
 | 优化项 | 实现位置 | 说明 |
 |--------|----------|------|
-| **IOProc 直通** | `output.rs` | `App → HAL → Hardware`，绕过 AudioUnit 层 |
+| **HALOutput 直接访问** | `output.rs` | 绕过系统混音器，直接访问硬件 |
 | 物理格式输出 | `output.rs` | 直接设置 `kAudioStreamPropertyPhysicalFormat`，绕过系统格式转换 |
 | 零拷贝输出 (Int32) | `output.rs` | ring buffer → 输出缓冲区直接读取 |
 | 整数直通路径 | `decoder.rs` | PCM 整数源直接转 i32，避免 f64 中间表示 |
-| i32 左对齐统一格式 | 全局 | 全程 i32 左对齐，避免多次转换 |
-| Hog Mode | `output.rs` | 独占设备，防止系统混音器干扰 |
+| i32 左对齐统一格式 | `format.rs` | 全程 i32 左对齐，避免多次转换 |
+| Hog Mode | `output.rs` | 独占设备，防止系统混音器干扰（HALOutput 模式） |
 | 采样率智能选择 | `output.rs` | 精确匹配 > 整数分频 > 最近值 |
 | CoreAudio SRC | 系统内置 | 高质量采样率转换，由 CoreAudio 处理 |
+| TPDF Dither | `output.rs` | Float32 输出时使用，realtime-safe 实现 |
 
 ### 性能优化
 
@@ -243,7 +257,8 @@ Stopped ──play()──→ Buffering ──prebuffer完成──→ Playing
 | ARM NEON SIMD | `decoder.rs` | 立体声 i16/i24 → i32 向量化转换 |
 | 2^n 容量位运算 | `ring_buffer.rs` | `mask & pos` 代替取模 |
 | 内存预分配 | 全局 | 所有缓冲区初始化时分配，回调中无 alloc |
-| TPDF Dither | `dither.rs` | xorshift32 PRNG，realtime-safe |
+| TPDF Dither | `output.rs` | xorshift32 PRNG，realtime-safe |
+| Mach 时间缓存 | `timing.rs` | timebase info 全局缓存，只查询一次 |
 
 ### 输出模式优先级
 
@@ -352,7 +367,7 @@ Source B ──→ ┘
 cargo build --release
 
 # 运行（需要音频文件）
-./target/release/hifi-replayer music.flac
+./target/release/roger-player music.flac
 
 # 运行测试
 cargo test

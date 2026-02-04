@@ -115,7 +115,7 @@ fn read_key_nonblocking() -> Option<KeyPress> {
 
 /// HiFi Replayer - High-fidelity audio player
 #[derive(Parser)]
-#[command(name = "hifi-replayer")]
+#[command(name = "roger-player")]
 #[command(author, version, about, long_about = None)]
 struct Cli {
     #[command(subcommand)]
@@ -202,9 +202,9 @@ fn main() -> anyhow::Result<()> {
             } else {
                 // 没有参数，显示帮助
                 println!("HiFi Replayer - Extreme quality audio player\n");
-                println!("Usage: hifi-replayer [OPTIONS] <FILE|DIR>");
-                println!("       hifi-replayer info");
-                println!("       hifi-replayer interactive <FILE>");
+                println!("Usage: roger-player [OPTIONS] <FILE|DIR>");
+                println!("       roger-player info");
+                println!("       roger-player interactive <FILE>");
                 println!("\nOptions:");
                 println!("  -b, --buffer-ms <MS>   Buffer size in milliseconds [default: 2000]");
                 println!("  -d, --device <ID|NAME> Select output device (use 'info' to list)");
@@ -241,8 +241,8 @@ fn show_device_info() -> anyhow::Result<()> {
     println!();
     println!("* = system default");
     println!("BT = Bluetooth (auto system mixer), USB = Wired/USB\n");
-    println!("Select device: hifi-replayer -d <ID> <file>");
-    println!("Example: hifi-replayer -d {} <file>", default_device.id);
+    println!("Select device: roger-player -d <ID> <file>");
+    println!("Example: roger-player -d {} <file>", default_device.id);
 
     Ok(())
 }
