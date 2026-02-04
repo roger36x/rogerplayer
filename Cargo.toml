@@ -31,6 +31,11 @@ libc = "0.2"
 # Random (for shuffle)
 rand = "0.8"
 
+# TUI
+ratatui = "0.26"
+crossterm = "0.27"
+chrono = "0.4"
+
 [target.'cfg(target_os = "macos")'.dependencies]
 # Core Audio bindings
 coreaudio-sys = "0.2"

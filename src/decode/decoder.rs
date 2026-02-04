@@ -109,10 +109,11 @@ impl AudioDecoder {
             .map_err(|_| DecodeError::UnsupportedFormat)?;
 
         let mut reader = probed.format;
-        let format_name = reader
-            .metadata()
-            .current()
-            .map(|m| format!("{:?}", m))
+        // 简单起见，直接使用文件扩展名作为格式名称
+        // symphonia 的 metadata debug 输出对用户不友好
+        let format_name = path.extension()
+            .and_then(|e| e.to_str())
+            .map(|s| s.to_uppercase())
             .unwrap_or_else(|| "Unknown".to_string());
 
         // 查找第一个音频轨道

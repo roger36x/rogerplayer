@@ -11,7 +11,9 @@
       "Bash(~/.cargo/bin/rustup target list:*)",
       "Bash(~/.cargo/bin/rustup target add:*)",
       "Bash(~/.cargo/bin/cargo build:*)",
-      "Bash(otool:*)"
+      "Bash(otool:*)",
+      "Bash(~/.cargo/bin/cargo:*)",
+      "Bash(/usr/local/bin/cargo:*)"
     ]
   }
 }

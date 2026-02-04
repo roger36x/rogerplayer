@@ -10,6 +10,7 @@
 mod audio;
 mod decode;
 mod engine;
+mod tui;
 
 use std::ffi::OsStr;
 use std::io::{self, Read as IoRead, Write};
@@ -174,6 +175,12 @@ enum Commands {
         /// Audio file to play
         file: PathBuf,
     },
+
+    /// Terminal UI mode
+    Tui {
+        /// Audio file or directory
+        file: Option<PathBuf>,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -196,6 +203,15 @@ fn main() -> anyhow::Result<()> {
         Some(Commands::Play { ref file }) => {
             simple_play(file, &cli)?;
         }
+        Some(Commands::Tui { ref file }) => {
+            let path = file.as_ref().or(cli.file.as_ref());
+            if let Some(p) = path {
+                tui_play(p, &cli)?;
+            } else {
+                println!("Please specify a file or directory for TUI mode.");
+                println!("Usage: roger-player tui <FILE|DIR>");
+            }
+        }
         None => {
             if let Some(ref file) = cli.file {
                 simple_play(file, &cli)?;
@@ -204,6 +220,7 @@ fn main() -> anyhow::Result<()> {
                 println!("HiFi Replayer - Extreme quality audio player\n");
                 println!("Usage: roger-player [OPTIONS] <FILE|DIR>");
                 println!("       roger-player info");
+                println!("       roger-player tui <FILE|DIR>");
                 println!("       roger-player interactive <FILE>");
                 println!("\nOptions:");
                 println!("  -b, --buffer-ms <MS>   Buffer size in milliseconds [default: 2000]");
@@ -648,6 +665,37 @@ fn interactive_play(file: &PathBuf, cli: &Cli) -> anyhow::Result<()> {
     println!("\n");
     engine.stop()?;
 
+    Ok(())
+}
+
+/// TUI 播放模式
+fn tui_play(path: &PathBuf, cli: &Cli) -> anyhow::Result<()> {
+    // 扫描文件
+    let mut files = if path.is_dir() {
+        scan_audio_files(path)?
+    } else {
+        if is_audio_file(path) {
+            vec![path.clone()]
+        } else {
+            return Err(anyhow::anyhow!("Not a supported audio file: {}", path.display()));
+        }
+    };
+
+    if files.is_empty() {
+        return Err(anyhow::anyhow!("No audio files found in: {}", path.display()));
+    }
+
+    // Shuffle
+    if cli.shuffle {
+        let mut rng = rand::thread_rng();
+        files.shuffle(&mut rng);
+    }
+
+    let config = create_engine_config(cli);
+    let app = crate::tui::model::App::new(config, files);
+    
+    crate::tui::controller::run(app)?;
+    
     Ok(())
 }
 
