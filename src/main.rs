@@ -16,7 +16,7 @@ use std::io::{self, Read as IoRead, Write};
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use rand::seq::SliceRandom;
@@ -73,13 +73,42 @@ impl Drop for RawModeGuard {
     }
 }
 
-/// 非阻塞读取一个字符
-fn read_char_nonblocking() -> Option<u8> {
+/// 按键类型
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyPress {
+    Space,
+    Left,
+    Right,
+    Other(u8),
+}
+
+/// 非阻塞读取按键（支持方向键转义序列）
+fn read_key_nonblocking() -> Option<KeyPress> {
     let mut buf = [0u8; 1];
     let stdin = io::stdin();
     let mut handle = stdin.lock();
+
     match handle.read(&mut buf) {
-        Ok(1) => Some(buf[0]),
+        Ok(1) => {
+            match buf[0] {
+                b' ' => Some(KeyPress::Space),
+                0x1B => {
+                    // ESC - 可能是方向键转义序列
+                    // 尝试读取后续字符: ESC [ <code>
+                    let mut seq = [0u8; 2];
+                    if handle.read(&mut seq).unwrap_or(0) == 2 && seq[0] == b'[' {
+                        match seq[1] {
+                            b'C' => Some(KeyPress::Right), // 右箭头
+                            b'D' => Some(KeyPress::Left),  // 左箭头
+                            _ => Some(KeyPress::Other(0x1B)),
+                        }
+                    } else {
+                        Some(KeyPress::Other(0x1B))
+                    }
+                }
+                ch => Some(KeyPress::Other(ch)),
+            }
+        }
         _ => None,
     }
 }
@@ -104,9 +133,13 @@ struct Cli {
     #[arg(long)]
     no_exclusive: bool,
 
-    /// Use system mixer instead of direct hardware access (recommended for Bluetooth)
-    #[arg(long)]
-    no_hal: bool,
+    /// Enable HAL direct hardware access (default, best quality)
+    #[arg(long, conflicts_with = "hal_off")]
+    hal_on: bool,
+
+    /// Disable HAL, use system mixer (recommended for Bluetooth)
+    #[arg(long, conflicts_with = "hal_on")]
+    hal_off: bool,
 
     /// Select output device by name or ID (use 'info' command to list devices)
     #[arg(short, long)]
@@ -336,7 +369,7 @@ fn play_directory(dir: &PathBuf, cli: &Cli) -> anyhow::Result<()> {
         );
     }
     println!();
-    println!("Controls: [Space] next | [Space x2] previous | [Ctrl+C] quit\n");
+    println!("Controls: [Space] pause/play | [→] next | [←] previous | [Ctrl+C] quit\n");
 
     // 设置 Ctrl+C 处理（在播放开始前设置一次）
     let running = Arc::new(std::sync::atomic::AtomicBool::new(true));
@@ -420,6 +453,9 @@ fn play_single_file(
         r.store(false, Ordering::SeqCst);
     })?;
 
+    // 进入终端原始模式（用于键盘控制）
+    let _raw_guard = RawModeGuard::enter();
+
     play_single_file_with_running(file, cli, track_info, running, false)?;
     Ok(())
 }
@@ -490,12 +526,8 @@ fn play_single_file_with_running(
 
     // 播放循环
     if track_info.is_none() {
-        println!("Playing. Press Ctrl+C to stop.\n");
+        println!("Playing. [Space] pause/play | [Ctrl+C] quit\n");
     }
-
-    // 双击检测状态
-    let mut pending_space: Option<Instant> = None;
-    const DOUBLE_TAP_THRESHOLD: Duration = Duration::from_millis(300);
 
     let mut skip_command = SkipCommand::None;
 
@@ -510,30 +542,25 @@ fn play_single_file_with_running(
             break;
         }
 
-        // 键盘控制（仅在目录模式下启用）
-        if keyboard_control {
-            if let Some(ch) = read_char_nonblocking() {
-                if ch == b' ' {
-                    if let Some(first_press) = pending_space {
-                        // 检查是否在双击窗口内
-                        if first_press.elapsed() < DOUBLE_TAP_THRESHOLD {
-                            // 双击：上一首
-                            skip_command = SkipCommand::Previous;
-                            break;
-                        }
-                    }
-                    // 记录这次空格按下的时间
-                    pending_space = Some(Instant::now());
+        // 键盘控制
+        // Space = 暂停/播放, → = 下一首, ← = 上一首
+        if let Some(key) = read_key_nonblocking() {
+            match key {
+                KeyPress::Space => {
+                    // 空格：暂停/播放
+                    let _ = engine.toggle_pause();
                 }
-            }
-
-            // 检查待处理的单击是否超时
-            if let Some(first_press) = pending_space {
-                if first_press.elapsed() >= DOUBLE_TAP_THRESHOLD {
-                    // 超时，确认为单击：下一首
+                KeyPress::Right if keyboard_control => {
+                    // →：下一首
                     skip_command = SkipCommand::Next;
                     break;
                 }
+                KeyPress::Left if keyboard_control => {
+                    // ←：上一首
+                    skip_command = SkipCommand::Previous;
+                    break;
+                }
+                _ => {}
             }
         }
 
@@ -652,7 +679,7 @@ fn create_engine_config(cli: &Cli) -> EngineConfig {
             buffer_frames: 512,
             exclusive_mode: !cli.no_exclusive,
             integer_mode: true,
-            use_hal: !cli.no_hal,
+            use_hal: !cli.hal_off,
             device_id,
         },
         buffer_frames,

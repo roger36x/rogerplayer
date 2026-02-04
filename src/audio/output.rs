@@ -26,6 +26,7 @@ type AudioObjectPropertyElement = u32;
 type OSStatus = i32;
 type AudioUnit = *mut c_void;
 type AudioComponentInstance = AudioUnit;
+type AudioDeviceIOProcID = *mut c_void;
 
 const K_AUDIO_OBJECT_SYSTEM_OBJECT: AudioObjectID = 1;
 const K_AUDIO_HARDWARE_PROPERTY_DEVICES: AudioObjectPropertySelector = 0x64657623; // 'dev#'
@@ -40,6 +41,12 @@ const K_AUDIO_DEVICE_PROPERTY_STREAM_CONFIGURATION: AudioObjectPropertySelector 
 const K_AUDIO_STREAM_PROPERTY_PHYSICAL_FORMAT: AudioObjectPropertySelector = 0x70667420; // 'pft '
 const K_AUDIO_DEVICE_PROPERTY_TRANSPORT_TYPE: AudioObjectPropertySelector = 0x7472616E; // 'tran'
 const K_AUDIO_OBJECT_PROPERTY_NAME: AudioObjectPropertySelector = 0x6E616D65; // 'name'
+
+// 设备能力查询属性
+const K_AUDIO_DEVICE_PROPERTY_BUFFER_FRAME_SIZE_RANGE: AudioObjectPropertySelector = 0x66737223; // 'fsr#'
+const K_AUDIO_DEVICE_PROPERTY_LATENCY: AudioObjectPropertySelector = 0x6C746E63; // 'ltnc'
+const K_AUDIO_DEVICE_PROPERTY_SAFETY_OFFSET: AudioObjectPropertySelector = 0x73616674; // 'saft'
+const K_AUDIO_STREAM_PROPERTY_AVAILABLE_PHYSICAL_FORMATS: AudioObjectPropertySelector = 0x6F706672; // 'opfr'
 
 // 设备传输类型
 const K_AUDIO_DEVICE_TRANSPORT_TYPE_BLUETOOTH: u32 = 0x626C7565; // 'blue'
@@ -214,6 +221,122 @@ extern "C" {
         data_size: u32,
         data: *const c_void,
     ) -> OSStatus;
+
+    // HAL IOProc API - 直接硬件访问，绕过 AudioUnit 层
+    fn AudioDeviceCreateIOProcID(
+        in_device: AudioDeviceID,
+        in_proc: Option<
+            unsafe extern "C" fn(
+                in_device: AudioObjectID,
+                in_now: *const AudioTimeStamp,
+                in_input_data: *const AudioBufferList,
+                in_input_time: *const AudioTimeStamp,
+                out_output_data: *mut AudioBufferList,
+                in_output_time: *const AudioTimeStamp,
+                in_client_data: *mut c_void,
+            ) -> OSStatus,
+        >,
+        in_client_data: *mut c_void,
+        out_io_proc_id: *mut AudioDeviceIOProcID,
+    ) -> OSStatus;
+
+    fn AudioDeviceDestroyIOProcID(
+        in_device: AudioDeviceID,
+        in_io_proc_id: AudioDeviceIOProcID,
+    ) -> OSStatus;
+
+    fn AudioDeviceStart(
+        in_device: AudioDeviceID,
+        in_proc_id: AudioDeviceIOProcID,
+    ) -> OSStatus;
+
+    fn AudioDeviceStop(
+        in_device: AudioDeviceID,
+        in_proc_id: AudioDeviceIOProcID,
+    ) -> OSStatus;
+}
+
+/// IOKit Power Management 相关类型和函数
+///
+/// 用于防止系统在播放期间进入节能模式（CPU 降频、睡眠等）
+mod power_management {
+    use core_foundation::base::TCFType;
+    use core_foundation::string::CFString;
+    use std::ffi::c_void;
+
+    pub type IOPMAssertionID = u32;
+
+    /// 断言级别
+    pub const K_IOPM_ASSERTION_LEVEL_ON: u32 = 255;
+
+    #[link(name = "IOKit", kind = "framework")]
+    extern "C" {
+        /// 创建电源管理断言
+        pub fn IOPMAssertionCreateWithName(
+            assertion_type: *const c_void,  // CFStringRef
+            assertion_level: u32,
+            assertion_name: *const c_void,  // CFStringRef
+            assertion_id: *mut IOPMAssertionID,
+        ) -> i32;
+
+        /// 释放电源管理断言
+        pub fn IOPMAssertionRelease(assertion_id: IOPMAssertionID) -> i32;
+    }
+
+    /// 电源断言包装器
+    ///
+    /// RAII 风格：创建时获取断言，Drop 时自动释放
+    pub struct PowerAssertion {
+        assertion_id: IOPMAssertionID,
+    }
+
+    impl PowerAssertion {
+        /// 创建电源断言，防止系统节能
+        ///
+        /// 使用 "PreventUserIdleSystemSleep" 类型：
+        /// - 防止系统空闲睡眠
+        /// - 防止 CPU 降频到低功耗状态
+        /// - 保持音频处理的时序稳定性
+        pub fn new(name: &str) -> Option<Self> {
+            // 断言类型：防止用户空闲时系统睡眠
+            let assertion_type = CFString::new("PreventUserIdleSystemSleep");
+            let assertion_name = CFString::new(name);
+
+            let mut assertion_id: IOPMAssertionID = 0;
+
+            let result = unsafe {
+                IOPMAssertionCreateWithName(
+                    assertion_type.as_concrete_TypeRef() as *const c_void,
+                    K_IOPM_ASSERTION_LEVEL_ON,
+                    assertion_name.as_concrete_TypeRef() as *const c_void,
+                    &mut assertion_id,
+                )
+            };
+
+            if result == 0 {
+                log::info!("Power assertion created: {} (ID: {})", name, assertion_id);
+                Some(Self { assertion_id })
+            } else {
+                log::warn!("Failed to create power assertion (error: {})", result);
+                None
+            }
+        }
+    }
+
+    impl Drop for PowerAssertion {
+        fn drop(&mut self) {
+            let result = unsafe { IOPMAssertionRelease(self.assertion_id) };
+            if result == 0 {
+                log::debug!("Power assertion released (ID: {})", self.assertion_id);
+            } else {
+                log::warn!(
+                    "Failed to release power assertion {} (error: {})",
+                    self.assertion_id,
+                    result
+                );
+            }
+        }
+    }
 }
 
 #[link(name = "AudioToolbox", kind = "framework")]
@@ -549,10 +672,27 @@ impl CallbackContext {
     }
 }
 
+/// 音频后端类型
+///
+/// 支持两种模式：
+/// - IOProc: 直接 HAL 层访问，绕过 AudioUnit，延迟更低
+/// - AudioUnit: 通过 AudioUnit 层，兼容性更好（蓝牙等）
+enum AudioBackend {
+    /// 直接 HAL IOProc（首选，最短信号路径）
+    HalIOProc {
+        io_proc_id: AudioDeviceIOProcID,
+    },
+    /// AudioUnit 输出（回退路径）
+    AudioUnit {
+        audio_unit: AudioUnit,
+    },
+}
+
 /// Core Audio AUHAL 输出
 pub struct AudioOutput {
     device_id: AudioDeviceID,
-    audio_unit: AudioUnit,
+    /// 音频后端（IOProc 或 AudioUnit）
+    backend: AudioBackend,
     config: OutputConfig,
     context: Option<Box<CallbackContext>>,
     original_sample_rate: f64,
@@ -562,6 +702,18 @@ pub struct AudioOutput {
     supported_sample_rates: Vec<f64>,
     /// 是否使用 HALOutput（直接硬件访问）
     is_hal_output: bool,
+    /// 是否使用直接 IOProc（绕过 AudioUnit）
+    is_direct_ioproc: bool,
+    /// 是否已暂停
+    paused: bool,
+    /// 电源管理断言（防止 CPU 降频）
+    power_assertion: Option<power_management::PowerAssertion>,
+    /// 设备最小缓冲帧数
+    min_buffer_frames: u32,
+    /// 设备延迟（帧数）
+    device_latency_frames: u32,
+    /// 安全偏移（帧数）
+    safety_offset_frames: u32,
 }
 
 impl AudioOutput {
@@ -809,6 +961,100 @@ impl AudioOutput {
         };
 
         cf_string.to_string()
+    }
+
+    /// 查询缓冲区帧数范围 (最小/最大)
+    ///
+    /// 用于 IOProc 模式下选择最优 buffer size
+    fn get_buffer_size_range(device_id: AudioDeviceID) -> Option<(u32, u32)> {
+        let address = AudioObjectPropertyAddress {
+            selector: K_AUDIO_DEVICE_PROPERTY_BUFFER_FRAME_SIZE_RANGE,
+            scope: K_AUDIO_OBJECT_PROPERTY_SCOPE_OUTPUT,
+            element: K_AUDIO_OBJECT_PROPERTY_ELEMENT_MAIN,
+        };
+
+        let mut range = AudioValueRange::default();
+        let mut size = std::mem::size_of::<AudioValueRange>() as u32;
+
+        let status = unsafe {
+            AudioObjectGetPropertyData(
+                device_id,
+                &address,
+                0,
+                ptr::null(),
+                &mut size,
+                &mut range as *mut _ as *mut c_void,
+            )
+        };
+
+        if status == NO_ERR {
+            Some((range.minimum as u32, range.maximum as u32))
+        } else {
+            log::debug!("Failed to query buffer size range (status {})", status);
+            None
+        }
+    }
+
+    /// 查询设备输出延迟 (帧数)
+    fn get_device_latency(device_id: AudioDeviceID) -> u32 {
+        let address = AudioObjectPropertyAddress {
+            selector: K_AUDIO_DEVICE_PROPERTY_LATENCY,
+            scope: K_AUDIO_OBJECT_PROPERTY_SCOPE_OUTPUT,
+            element: K_AUDIO_OBJECT_PROPERTY_ELEMENT_MAIN,
+        };
+
+        let mut latency: u32 = 0;
+        let mut size = std::mem::size_of::<u32>() as u32;
+
+        let status = unsafe {
+            AudioObjectGetPropertyData(
+                device_id,
+                &address,
+                0,
+                ptr::null(),
+                &mut size,
+                &mut latency as *mut _ as *mut c_void,
+            )
+        };
+
+        if status == NO_ERR {
+            latency
+        } else {
+            log::debug!("Failed to query device latency (status {})", status);
+            0
+        }
+    }
+
+    /// 查询安全偏移 (帧数)
+    ///
+    /// 安全偏移是系统推荐的额外缓冲，用于避免 underrun
+    fn get_safety_offset(device_id: AudioDeviceID) -> u32 {
+        let address = AudioObjectPropertyAddress {
+            selector: K_AUDIO_DEVICE_PROPERTY_SAFETY_OFFSET,
+            scope: K_AUDIO_OBJECT_PROPERTY_SCOPE_OUTPUT,
+            element: K_AUDIO_OBJECT_PROPERTY_ELEMENT_MAIN,
+        };
+
+        let mut offset: u32 = 0;
+        let mut size = std::mem::size_of::<u32>() as u32;
+
+        let status = unsafe {
+            AudioObjectGetPropertyData(
+                device_id,
+                &address,
+                0,
+                ptr::null(),
+                &mut size,
+                &mut offset as *mut _ as *mut c_void,
+            )
+        };
+
+        if status == NO_ERR {
+            offset
+        } else {
+            log::debug!("Failed to query safety offset (status {})", status);
+            0
+        }
     }
 
     /// 获取设备支持的采样率
@@ -1226,10 +1472,12 @@ impl AudioOutput {
         };
     }
 
-    /// 创建 AUHAL 输出
+    /// 创建音频输出
     ///
-    /// 优先使用 HALOutput 绕过系统混音器，直接访问设备
-    /// 如果失败则回退到 DefaultOutput
+    /// 优先级：
+    /// 1. IOProc（直接 HAL，最低延迟）
+    /// 2. HALOutput AudioUnit（绕过系统混音器）
+    /// 3. DefaultOutput（通过系统混音器，蓝牙设备）
     pub fn new(config: OutputConfig) -> Result<Self, OutputError> {
         // 获取目标设备（指定的或默认的）
         let target_device = if let Some(device_id) = config.device_id {
@@ -1240,15 +1488,6 @@ impl AudioOutput {
 
         log::info!("Target device: {} (ID: {})", target_device.name, target_device.id);
 
-        // 首先尝试 HALOutput（绕过混音器，更低延迟，更干净的信号路径）
-        let desc_hal = AudioComponentDescription {
-            component_type: K_AUDIO_UNIT_TYPE_OUTPUT,
-            component_sub_type: K_AUDIO_UNIT_SUB_TYPE_HAL_OUTPUT,
-            component_manufacturer: K_AUDIO_UNIT_MANUFACTURER_APPLE,
-            component_flags: 0,
-            component_flags_mask: 0,
-        };
-
         // 检测目标设备是否是蓝牙
         let is_bluetooth = target_device.is_bluetooth;
         if is_bluetooth {
@@ -1257,9 +1496,29 @@ impl AudioOutput {
 
         // 根据配置选择输出模式（蓝牙设备自动使用系统混音器）
         if config.use_hal && !is_bluetooth {
+            // 1. 首先尝试 IOProc（直接 HAL，最短信号路径）
+            match Self::new_hal_ioproc(config.clone(), &target_device) {
+                Ok(output) => {
+                    log::info!("Using IOProc (direct HAL, lowest latency)");
+                    return Ok(output);
+                }
+                Err(e) => {
+                    log::info!("IOProc failed: {:?}, trying HALOutput AudioUnit", e);
+                }
+            }
+
+            // 2. 回退到 HALOutput AudioUnit
+            let desc_hal = AudioComponentDescription {
+                component_type: K_AUDIO_UNIT_TYPE_OUTPUT,
+                component_sub_type: K_AUDIO_UNIT_SUB_TYPE_HAL_OUTPUT,
+                component_manufacturer: K_AUDIO_UNIT_MANUFACTURER_APPLE,
+                component_flags: 0,
+                component_flags_mask: 0,
+            };
+
             let component_hal = unsafe { AudioComponentFindNext(ptr::null_mut(), &desc_hal) };
             if !component_hal.is_null() {
-                log::info!("Found HALOutput component, using direct device access");
+                log::info!("Found HALOutput component, using AudioUnit");
                 match Self::new_hal_output(component_hal, config.clone(), &target_device) {
                     Ok(output) => return Ok(output),
                     Err(e) => {
@@ -1271,7 +1530,7 @@ impl AudioOutput {
             log::info!("HALOutput disabled by config, using system mixer");
         }
 
-        // 回退到 DefaultOutput（通过系统混音器）
+        // 3. 回退到 DefaultOutput（通过系统混音器）
         log::info!("Using DefaultOutput (via system mixer)");
         let desc = AudioComponentDescription {
             component_type: K_AUDIO_UNIT_TYPE_OUTPUT,
@@ -1287,6 +1546,43 @@ impl AudioOutput {
         }
 
         Self::new_default_output(component, config)
+    }
+
+    /// 使用直接 HAL IOProc 创建输出（最短信号路径）
+    fn new_hal_ioproc(config: OutputConfig, device: &DeviceInfo) -> Result<Self, OutputError> {
+        // 查询设备能力
+        let (min_buffer, max_buffer) = Self::get_buffer_size_range(device.id)
+            .unwrap_or((64, 4096));
+        let device_latency = Self::get_device_latency(device.id);
+        let safety_offset = Self::get_safety_offset(device.id);
+
+        log::info!(
+            "IOProc device capabilities: buffer range [{}-{}], latency {} frames, safety offset {} frames",
+            min_buffer, max_buffer, device_latency, safety_offset
+        );
+
+        // 验证 buffer 大小在有效范围内
+        let buffer_frames = config.buffer_frames.max(min_buffer).min(max_buffer);
+
+        Ok(Self {
+            device_id: device.id,
+            backend: AudioBackend::HalIOProc {
+                io_proc_id: ptr::null_mut(), // 在 start() 中创建
+            },
+            config: OutputConfig { buffer_frames, ..config },
+            context: None,
+            original_sample_rate: device.current_sample_rate,
+            hog_mode_acquired: false,
+            actual_format: AudioFormat::new(48000, 2, 32),
+            supported_sample_rates: device.supported_sample_rates.clone(),
+            is_hal_output: true,
+            is_direct_ioproc: true,
+            paused: false,
+            power_assertion: None,
+            min_buffer_frames: min_buffer,
+            device_latency_frames: device_latency,
+            safety_offset_frames: safety_offset,
+        })
     }
 
     /// 使用 HALOutput 创建输出（绕过系统混音器）
@@ -1315,9 +1611,15 @@ impl AudioOutput {
             return Err(OutputError::AudioUnitFailed(status));
         }
 
+        // 查询设备能力
+        let (min_buffer, _max_buffer) = Self::get_buffer_size_range(device.id)
+            .unwrap_or((64, 4096));
+        let device_latency = Self::get_device_latency(device.id);
+        let safety_offset = Self::get_safety_offset(device.id);
+
         Ok(Self {
             device_id: device.id,
-            audio_unit,
+            backend: AudioBackend::AudioUnit { audio_unit },
             config,
             context: None,
             original_sample_rate: device.current_sample_rate,
@@ -1325,6 +1627,12 @@ impl AudioOutput {
             actual_format: AudioFormat::new(48000, 2, 32),
             supported_sample_rates: device.supported_sample_rates.clone(),
             is_hal_output: true,
+            is_direct_ioproc: false,
+            paused: false,
+            power_assertion: None,
+            min_buffer_frames: min_buffer,
+            device_latency_frames: device_latency,
+            safety_offset_frames: safety_offset,
         })
     }
 
@@ -1339,7 +1647,7 @@ impl AudioOutput {
         // DefaultOutput 不需要手动设置设备
         Ok(Self {
             device_id: 0,  // DefaultOutput 不使用具体设备 ID
-            audio_unit,
+            backend: AudioBackend::AudioUnit { audio_unit },
             config,
             context: None,
             original_sample_rate: 48000.0,
@@ -1347,17 +1655,37 @@ impl AudioOutput {
             actual_format: AudioFormat::new(48000, 2, 32),
             supported_sample_rates: vec![44100.0, 48000.0],  // DefaultOutput 常见支持率
             is_hal_output: false,
+            is_direct_ioproc: false,
+            paused: false,
+            power_assertion: None,
+            min_buffer_frames: 512,
+            device_latency_frames: 0,
+            safety_offset_frames: 0,
         })
+    }
+
+    /// 获取 AudioUnit（如果是 AudioUnit 后端）
+    fn get_audio_unit(&self) -> Option<AudioUnit> {
+        match &self.backend {
+            AudioBackend::AudioUnit { audio_unit } => Some(*audio_unit),
+            AudioBackend::HalIOProc { .. } => None,
+        }
     }
 
     /// 查询输出布局
     fn query_output_layout(&self) -> Result<OutputLayout, OutputError> {
+        // IOProc 模式下使用 Interleaved
+        let audio_unit = match self.get_audio_unit() {
+            Some(au) => au,
+            None => return Ok(OutputLayout::Interleaved),
+        };
+
         let mut asbd = AudioStreamBasicDescription::default();
         let mut size = std::mem::size_of::<AudioStreamBasicDescription>() as u32;
 
         let status = unsafe {
             AudioUnitGetProperty(
-                self.audio_unit,
+                audio_unit,
                 K_AUDIO_UNIT_PROPERTY_STREAM_FORMAT,
                 K_AUDIO_UNIT_SCOPE_OUTPUT,
                 0,
@@ -1552,6 +1880,12 @@ impl AudioOutput {
     ///
     /// 注意：Input scope 使用源文件采样率，CoreAudio 会自动做 SRC 到设备采样率
     fn try_set_integer_format(&self, format: &AudioFormat) -> (bool, OutputFormatMode) {
+        // IOProc 模式下不使用此方法，直接使用物理格式
+        let audio_unit = match self.get_audio_unit() {
+            Some(au) => au,
+            None => return (false, OutputFormatMode::Float32),
+        };
+
         // 优先尝试 32-bit Integer（使用源文件采样率，CoreAudio 会做 SRC）
         let asbd_int32 = AudioStreamBasicDescription {
             sample_rate: format.sample_rate as f64,
@@ -1567,7 +1901,7 @@ impl AudioOutput {
 
         let status = unsafe {
             AudioUnitSetProperty(
-                self.audio_unit,
+                audio_unit,
                 K_AUDIO_UNIT_PROPERTY_STREAM_FORMAT,
                 K_AUDIO_UNIT_SCOPE_INPUT,
                 0,
@@ -1596,7 +1930,7 @@ impl AudioOutput {
 
         let status = unsafe {
             AudioUnitSetProperty(
-                self.audio_unit,
+                audio_unit,
                 K_AUDIO_UNIT_PROPERTY_STREAM_FORMAT,
                 K_AUDIO_UNIT_SCOPE_INPUT,
                 0,
@@ -1652,35 +1986,39 @@ impl AudioOutput {
             // 设置缓冲区大小
             Self::set_buffer_size(self.device_id, self.config.buffer_frames)?;
 
-            // 设置输出设备
-            let status = unsafe {
-                AudioUnitSetProperty(
-                    self.audio_unit,
-                    K_AUDIO_OUTPUT_UNIT_PROPERTY_CURRENT_DEVICE,
-                    K_AUDIO_UNIT_SCOPE_GLOBAL,
-                    0,
-                    &self.device_id as *const _ as *const c_void,
-                    std::mem::size_of::<AudioDeviceID>() as u32,
-                )
-            };
-            // Ignore error - will use DefaultOutput
-            let _ = status;
+            // 设置输出设备（仅 AudioUnit 后端）
+            if let Some(audio_unit) = self.get_audio_unit() {
+                let status = unsafe {
+                    AudioUnitSetProperty(
+                        audio_unit,
+                        K_AUDIO_OUTPUT_UNIT_PROPERTY_CURRENT_DEVICE,
+                        K_AUDIO_UNIT_SCOPE_GLOBAL,
+                        0,
+                        &self.device_id as *const _ as *const c_void,
+                        std::mem::size_of::<AudioDeviceID>() as u32,
+                    )
+                };
+                // Ignore error - will use DefaultOutput
+                let _ = status;
+            }
         }
 
-        // 启用输出（DefaultOutput 可能不支持此属性，忽略错误）
-        let enable_io: u32 = 1;
-        let status = unsafe {
-            AudioUnitSetProperty(
-                self.audio_unit,
-                K_AUDIO_OUTPUT_UNIT_PROPERTY_ENABLE_IO,
-                K_AUDIO_UNIT_SCOPE_OUTPUT,
-                0,
-                &enable_io as *const _ as *const c_void,
-                std::mem::size_of::<u32>() as u32,
-            )
-        };
-        // EnableIO may not be supported on all devices
-        let _ = status;
+        // 启用输出（仅 AudioUnit 后端，DefaultOutput 可能不支持此属性）
+        if let Some(audio_unit) = self.get_audio_unit() {
+            let enable_io: u32 = 1;
+            let status = unsafe {
+                AudioUnitSetProperty(
+                    audio_unit,
+                    K_AUDIO_OUTPUT_UNIT_PROPERTY_ENABLE_IO,
+                    K_AUDIO_UNIT_SCOPE_OUTPUT,
+                    0,
+                    &enable_io as *const _ as *const c_void,
+                    std::mem::size_of::<u32>() as u32,
+                )
+            };
+            // EnableIO may not be supported on all devices
+            let _ = status;
+        }
 
         // 尝试设置流格式
         // 优先级：Physical Format (直接硬件，仅当不需要 SRC 时) > ASBD Integer > Float32
@@ -1688,8 +2026,8 @@ impl AudioOutput {
         let device_sample_rate = self.config.sample_rate;
         let needs_src = format.sample_rate != device_sample_rate;
 
-        // 辅助函数：设置 Float32 格式
-        let set_float32_format = |audio_unit, format: &AudioFormat| {
+        // 辅助函数：设置 Float32 格式（仅 AudioUnit 后端）
+        let set_float32_format = |audio_unit: AudioUnit, format: &AudioFormat| {
             let asbd = AudioStreamBasicDescription {
                 sample_rate: format.sample_rate as f64,
                 format_id: K_AUDIO_FORMAT_LINEAR_PCM,
@@ -1713,8 +2051,19 @@ impl AudioOutput {
             }
         };
 
-        let output_mode = if self.config.integer_mode && self.device_id != 0 {
-            // 只有不需要 SRC 时才尝试物理格式（直接硬件访问，绕过 SRC）
+        // 确定输出模式
+        let output_mode = if self.is_direct_ioproc {
+            // IOProc 模式：优先物理格式，否则 Float32
+            if !needs_src {
+                self.try_set_physical_format(&format, device_sample_rate)
+                    .map(|(_, mode)| mode)
+                    .unwrap_or(OutputFormatMode::Float32)
+            } else {
+                log::info!("IOProc with SRC: {}Hz → {}Hz, using Float32", format.sample_rate, device_sample_rate);
+                OutputFormatMode::Float32
+            }
+        } else if self.config.integer_mode && self.device_id != 0 {
+            // AudioUnit 模式：物理格式 > Integer > Float32
             let physical_mode = if !needs_src {
                 self.try_set_physical_format(&format, device_sample_rate).map(|(_, mode)| mode)
             } else {
@@ -1730,13 +2079,17 @@ impl AudioOutput {
                 if success {
                     mode
                 } else {
-                    let _ = set_float32_format(self.audio_unit, &format);
+                    if let Some(au) = self.get_audio_unit() {
+                        let _ = set_float32_format(au, &format);
+                    }
                     OutputFormatMode::Float32
                 }
             }
         } else {
             // DefaultOutput 使用 Float32
-            let _ = set_float32_format(self.audio_unit, &format);
+            if let Some(au) = self.get_audio_unit() {
+                let _ = set_float32_format(au, &format);
+            }
             OutputFormatMode::Float32
         };
 
@@ -1790,41 +2143,71 @@ impl AudioOutput {
 
         let context_ptr = Box::into_raw(context);
 
-        // 设置 render callback
-        let callback_struct = AURenderCallbackStruct {
-            input_proc: render_callback,
-            input_proc_ref_con: context_ptr as *mut c_void,
-        };
+        // 根据后端类型设置回调并启动
+        match &mut self.backend {
+            AudioBackend::HalIOProc { io_proc_id } => {
+                // IOProc 模式：直接 HAL 层回调
+                let status = unsafe {
+                    AudioDeviceCreateIOProcID(
+                        self.device_id,
+                        Some(hal_io_proc),
+                        context_ptr as *mut c_void,
+                        io_proc_id,
+                    )
+                };
+                if status != NO_ERR {
+                    unsafe { let _ = Box::from_raw(context_ptr); }
+                    return Err(OutputError::AudioUnitFailed(status));
+                }
 
-        let status = unsafe {
-            AudioUnitSetProperty(
-                self.audio_unit,
-                K_AUDIO_UNIT_PROPERTY_SET_RENDER_CALLBACK,
-                K_AUDIO_UNIT_SCOPE_INPUT,
-                0,
-                &callback_struct as *const _ as *const c_void,
-                std::mem::size_of::<AURenderCallbackStruct>() as u32,
-            )
-        };
-        if status != NO_ERR {
-            unsafe {
-                let _ = Box::from_raw(context_ptr);
+                self.context = Some(unsafe { Box::from_raw(context_ptr) });
+
+                // 启动设备
+                let status = unsafe { AudioDeviceStart(self.device_id, *io_proc_id) };
+                if status != NO_ERR {
+                    unsafe { AudioDeviceDestroyIOProcID(self.device_id, *io_proc_id); }
+                    *io_proc_id = ptr::null_mut();
+                    return Err(OutputError::AudioUnitFailed(status));
+                }
+
+                log::info!("IOProc started: direct HAL callback (lowest latency path)");
             }
-            return Err(OutputError::AudioUnitFailed(status));
-        }
+            AudioBackend::AudioUnit { audio_unit } => {
+                // AudioUnit 模式：通过 AudioUnit 层回调
+                let callback_struct = AURenderCallbackStruct {
+                    input_proc: render_callback,
+                    input_proc_ref_con: context_ptr as *mut c_void,
+                };
 
-        self.context = Some(unsafe { Box::from_raw(context_ptr) });
+                let status = unsafe {
+                    AudioUnitSetProperty(
+                        *audio_unit,
+                        K_AUDIO_UNIT_PROPERTY_SET_RENDER_CALLBACK,
+                        K_AUDIO_UNIT_SCOPE_INPUT,
+                        0,
+                        &callback_struct as *const _ as *const c_void,
+                        std::mem::size_of::<AURenderCallbackStruct>() as u32,
+                    )
+                };
+                if status != NO_ERR {
+                    unsafe { let _ = Box::from_raw(context_ptr); }
+                    return Err(OutputError::AudioUnitFailed(status));
+                }
 
-        // 初始化 AudioUnit
-        let status = unsafe { AudioUnitInitialize(self.audio_unit) };
-        if status != NO_ERR {
-            return Err(OutputError::AudioUnitFailed(status));
-        }
+                self.context = Some(unsafe { Box::from_raw(context_ptr) });
 
-        // 启动
-        let status = unsafe { AudioOutputUnitStart(self.audio_unit) };
-        if status != NO_ERR {
-            return Err(OutputError::AudioUnitFailed(status));
+                // 初始化 AudioUnit
+                let status = unsafe { AudioUnitInitialize(*audio_unit) };
+                if status != NO_ERR {
+                    return Err(OutputError::AudioUnitFailed(status));
+                }
+
+                // 启动
+                let status = unsafe { AudioOutputUnitStart(*audio_unit) };
+                if status != NO_ERR {
+                    return Err(OutputError::AudioUnitFailed(status));
+                }
+            }
         }
 
         // 如果源采样率与设备采样率不同，记录警告
@@ -1835,6 +2218,10 @@ impl AudioOutput {
                 device_sample_rate
             );
         }
+
+        // 创建电源管理断言，防止 CPU 降频
+        // 这对于保持音频处理的时序稳定性非常重要
+        self.power_assertion = power_management::PowerAssertion::new("HiFi Replayer Audio Playback");
 
         log::info!(
             "Audio output started: {}Hz (device), {} channels, {}bit, {:?}, mode={:?}",
@@ -1848,15 +2235,91 @@ impl AudioOutput {
         Ok(())
     }
 
+    /// 暂停输出
+    pub fn pause(&mut self) -> Result<(), OutputError> {
+        if self.paused {
+            return Ok(());
+        }
+
+        let status = match &self.backend {
+            AudioBackend::HalIOProc { io_proc_id } => {
+                if io_proc_id.is_null() {
+                    return Ok(());
+                }
+                unsafe { AudioDeviceStop(self.device_id, *io_proc_id) }
+            }
+            AudioBackend::AudioUnit { audio_unit } => {
+                if audio_unit.is_null() {
+                    return Ok(());
+                }
+                unsafe { AudioOutputUnitStop(*audio_unit) }
+            }
+        };
+
+        if status != NO_ERR {
+            return Err(OutputError::AudioUnitFailed(status));
+        }
+
+        self.paused = true;
+        log::info!("Audio output paused");
+        Ok(())
+    }
+
+    /// 恢复输出
+    pub fn resume(&mut self) -> Result<(), OutputError> {
+        if !self.paused {
+            return Ok(());
+        }
+
+        let status = match &self.backend {
+            AudioBackend::HalIOProc { io_proc_id } => {
+                if io_proc_id.is_null() {
+                    return Ok(());
+                }
+                unsafe { AudioDeviceStart(self.device_id, *io_proc_id) }
+            }
+            AudioBackend::AudioUnit { audio_unit } => {
+                if audio_unit.is_null() {
+                    return Ok(());
+                }
+                unsafe { AudioOutputUnitStart(*audio_unit) }
+            }
+        };
+
+        if status != NO_ERR {
+            return Err(OutputError::AudioUnitFailed(status));
+        }
+
+        self.paused = false;
+        log::info!("Audio output resumed");
+        Ok(())
+    }
+
+    /// 是否已暂停
+    pub fn is_paused(&self) -> bool {
+        self.paused
+    }
+
     /// 停止输出
     pub fn stop(&mut self) -> Result<(), OutputError> {
         if let Some(ref context) = self.context {
             context.running.store(false, Ordering::Release);
         }
 
-        if !self.audio_unit.is_null() {
-            let _ = unsafe { AudioOutputUnitStop(self.audio_unit) };
-            let _ = unsafe { AudioUnitUninitialize(self.audio_unit) };
+        match &mut self.backend {
+            AudioBackend::HalIOProc { io_proc_id } => {
+                if !io_proc_id.is_null() {
+                    let _ = unsafe { AudioDeviceStop(self.device_id, *io_proc_id) };
+                    let _ = unsafe { AudioDeviceDestroyIOProcID(self.device_id, *io_proc_id) };
+                    *io_proc_id = ptr::null_mut();
+                }
+            }
+            AudioBackend::AudioUnit { audio_unit } => {
+                if !audio_unit.is_null() {
+                    let _ = unsafe { AudioOutputUnitStop(*audio_unit) };
+                    let _ = unsafe { AudioUnitUninitialize(*audio_unit) };
+                }
+            }
         }
 
         // 释放独占模式
@@ -1869,6 +2332,9 @@ impl AudioOutput {
         if self.device_id != 0 {
             let _ = Self::set_sample_rate(self.device_id, self.original_sample_rate);
         }
+
+        // 释放电源管理断言（允许系统恢复节能模式）
+        self.power_assertion = None;
 
         self.context = None;
 
@@ -1921,13 +2387,254 @@ impl Drop for AudioOutput {
     fn drop(&mut self) {
         let _ = self.stop();
 
-        if !self.audio_unit.is_null() {
-            let _ = unsafe { AudioComponentInstanceDispose(self.audio_unit) };
+        // 清理 AudioUnit（IOProc 在 stop 中已清理）
+        if let AudioBackend::AudioUnit { audio_unit } = &self.backend {
+            if !audio_unit.is_null() {
+                let _ = unsafe { AudioComponentInstanceDispose(*audio_unit) };
+            }
         }
     }
 }
 
-/// Render Callback
+/// 共享的音频输出处理逻辑
+///
+/// 供 hal_io_proc 和 render_callback 共用，避免代码重复。
+/// 处理 Int32/Int24/Float32 三种输出格式。
+///
+/// **绝对禁止：**
+/// - 锁
+/// - 分配
+/// - I/O
+#[inline(always)]
+unsafe fn process_audio_output(
+    ctx: &mut CallbackContext,
+    buffer_list: &mut AudioBufferList,
+    samples_needed: usize,
+) {
+    if buffer_list.number_buffers == 0 {
+        return;
+    }
+
+    match ctx.output_mode {
+        OutputFormatMode::Int32 => {
+            // 零拷贝路径：直接从 ring buffer 读取到输出缓冲区
+            let output_ptr = buffer_list.buffers[0].data as *mut i32;
+            let output_samples = buffer_list.buffers[0].data_byte_size as usize / 4;
+            let output_slice = std::slice::from_raw_parts_mut(output_ptr, output_samples);
+
+            let count = samples_needed.min(output_slice.len());
+            let samples_read = ctx.ring_buffer.read(&mut output_slice[..count]);
+            ctx.stats.add_samples_played(samples_read as u64);
+
+            // 填零
+            for i in samples_read..output_slice.len() {
+                output_slice[i] = 0;
+            }
+
+            if samples_read < count {
+                ctx.stats.record_underrun();
+            }
+        }
+        OutputFormatMode::Int24 => {
+            let actual_samples = samples_needed.min(ctx.sample_buffer.len());
+            let sample_buffer = &mut ctx.sample_buffer[..actual_samples];
+            let samples_read = ctx.ring_buffer.read(sample_buffer);
+            ctx.stats.add_samples_played(samples_read as u64);
+
+            if samples_read < actual_samples {
+                ctx.stats.record_underrun();
+                for i in samples_read..actual_samples {
+                    sample_buffer[i] = 0;
+                }
+            }
+
+            let output_ptr = buffer_list.buffers[0].data as *mut u8;
+            let output_bytes = buffer_list.buffers[0].data_byte_size as usize;
+            let output_slice = std::slice::from_raw_parts_mut(output_ptr, output_bytes);
+
+            let count = actual_samples.min(output_bytes / 3);
+
+            if ctx.source_bits <= 24 {
+                for i in 0..count {
+                    let bytes = sample_buffer[i].to_le_bytes();
+                    output_slice[i * 3] = bytes[1];
+                    output_slice[i * 3 + 1] = bytes[2];
+                    output_slice[i * 3 + 2] = bytes[3];
+                }
+            } else {
+                for i in 0..count {
+                    let sample = sample_buffer[i];
+                    let r1 = (ctx.dither.next_u32() & 0xFF) as i32;
+                    let r2 = (ctx.dither.next_u32() & 0xFF) as i32;
+                    let dither = (r1 + r2 - 256) << 8;
+                    let dithered = sample.saturating_add(dither);
+
+                    let bytes = dithered.to_le_bytes();
+                    output_slice[i * 3] = bytes[1];
+                    output_slice[i * 3 + 1] = bytes[2];
+                    output_slice[i * 3 + 2] = bytes[3];
+                }
+            }
+
+            for i in (count * 3)..output_bytes {
+                output_slice[i] = 0;
+            }
+        }
+        OutputFormatMode::Float32 => {
+            let actual_samples = samples_needed.min(ctx.sample_buffer.len());
+            let sample_buffer = &mut ctx.sample_buffer[..actual_samples];
+            let samples_read = ctx.ring_buffer.read(sample_buffer);
+            ctx.stats.add_samples_played(samples_read as u64);
+
+            if samples_read < actual_samples {
+                ctx.stats.record_underrun();
+                for i in samples_read..actual_samples {
+                    sample_buffer[i] = 0;
+                }
+            }
+
+            let output_ptr = buffer_list.buffers[0].data as *mut f32;
+            let output_samples = buffer_list.buffers[0].data_byte_size as usize / 4;
+            let output_slice = std::slice::from_raw_parts_mut(output_ptr, output_samples);
+
+            const DITHER_SCALE: f32 = 1.0 / 8388608.0;
+            const I32_TO_FLOAT: f32 = 1.0 / 2147483648.0;
+
+            let count = actual_samples.min(output_slice.len());
+
+            #[cfg(target_arch = "aarch64")]
+            {
+                use std::arch::aarch64::*;
+
+                let scale_vec = vdupq_n_f32(I32_TO_FLOAT);
+                let dither_scale_vec = vdupq_n_f32(DITHER_SCALE);
+
+                let chunks8 = count / 8;
+                for chunk_idx in 0..chunks8 {
+                    let i = chunk_idx * 8;
+
+                    let i32x4_a = vld1q_s32(sample_buffer.as_ptr().add(i));
+                    let i32x4_b = vld1q_s32(sample_buffer.as_ptr().add(i + 4));
+
+                    let scaled_a = vmulq_f32(vcvtq_f32_s32(i32x4_a), scale_vec);
+                    let scaled_b = vmulq_f32(vcvtq_f32_s32(i32x4_b), scale_vec);
+
+                    let dither_vals: [f32; 8] = [
+                        ctx.dither.next_tpdf(),
+                        ctx.dither.next_tpdf(),
+                        ctx.dither.next_tpdf(),
+                        ctx.dither.next_tpdf(),
+                        ctx.dither.next_tpdf(),
+                        ctx.dither.next_tpdf(),
+                        ctx.dither.next_tpdf(),
+                        ctx.dither.next_tpdf(),
+                    ];
+
+                    let dither_a = vmulq_f32(vld1q_f32(dither_vals.as_ptr()), dither_scale_vec);
+                    let dither_b = vmulq_f32(vld1q_f32(dither_vals.as_ptr().add(4)), dither_scale_vec);
+
+                    let result_a = vaddq_f32(scaled_a, dither_a);
+                    let result_b = vaddq_f32(scaled_b, dither_b);
+
+                    vst1q_f32(output_slice.as_mut_ptr().add(i), result_a);
+                    vst1q_f32(output_slice.as_mut_ptr().add(i + 4), result_b);
+                }
+
+                for i in (chunks8 * 8)..count {
+                    let sample = sample_buffer[i] as f32 * I32_TO_FLOAT;
+                    let dither = ctx.dither.next_tpdf() * DITHER_SCALE;
+                    output_slice[i] = sample + dither;
+                }
+            }
+
+            #[cfg(not(target_arch = "aarch64"))]
+            {
+                for i in 0..count {
+                    let sample = sample_buffer[i] as f32 * I32_TO_FLOAT;
+                    let dither = ctx.dither.next_tpdf() * DITHER_SCALE;
+                    output_slice[i] = sample + dither;
+                }
+            }
+
+            for i in count..output_slice.len() {
+                output_slice[i] = 0.0;
+            }
+        }
+    }
+}
+
+/// HAL IOProc 回调
+///
+/// 直接 HAL 层回调，绕过 AudioUnit 层。
+/// 与 render_callback 相比，延迟更低、时序更可预测。
+///
+/// **绝对禁止：**
+/// - 锁
+/// - 分配
+/// - I/O
+/// - println!
+unsafe extern "C" fn hal_io_proc(
+    _in_device: AudioObjectID,
+    in_now: *const AudioTimeStamp,
+    _in_input_data: *const AudioBufferList,
+    _in_input_time: *const AudioTimeStamp,
+    out_output_data: *mut AudioBufferList,
+    in_output_time: *const AudioTimeStamp,
+    in_client_data: *mut c_void,
+) -> OSStatus {
+    let ctx = &mut *(in_client_data as *mut CallbackContext);
+
+    // 检查是否停止
+    if !ctx.running.load(Ordering::Acquire) {
+        // 填充静音
+        let buffer_list = &mut *out_output_data;
+        if buffer_list.number_buffers > 0 {
+            let buf = &mut buffer_list.buffers[0];
+            ptr::write_bytes(buf.data as *mut u8, 0, buf.data_byte_size as usize);
+        }
+        return NO_ERR;
+    }
+
+    // 首次调用时设置实时线程策略
+    if ctx.thread_policy_set
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        ctx.set_realtime_thread_policy();
+    }
+
+    // 使用 output_time 获取更精确的时间戳（音频实际输出时间）
+    let host_time = if !in_output_time.is_null() {
+        (*in_output_time).valid_host_time()
+    } else if !in_now.is_null() {
+        (*in_now).valid_host_time()
+    } else {
+        0
+    };
+    ctx.stats.on_callback_with_timestamp(&ctx.ring_buffer, host_time);
+
+    let buffer_list = &mut *out_output_data;
+    if buffer_list.number_buffers == 0 {
+        return NO_ERR;
+    }
+
+    // 从 buffer 大小计算帧数
+    let buf = &buffer_list.buffers[0];
+    let bytes_per_sample = match ctx.output_mode {
+        OutputFormatMode::Int32 | OutputFormatMode::Float32 => 4,
+        OutputFormatMode::Int24 => 3,
+    };
+    let channels = ctx.format.channels as usize;
+    let frames = buf.data_byte_size as usize / (bytes_per_sample * channels);
+    let samples_needed = frames * channels;
+
+    // 调用共享的音频处理逻辑
+    process_audio_output(ctx, buffer_list, samples_needed);
+
+    NO_ERR
+}
+
+/// Render Callback (AudioUnit)
 ///
 /// **绝对禁止：**
 /// - 锁
@@ -1949,7 +2656,6 @@ extern "C" fn render_callback(
     }
 
     // 首次调用时设置 IO 线程的实时调度策略
-    // 使用 compare_exchange 确保只执行一次
     if ctx.thread_policy_set
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .is_ok()
@@ -1961,166 +2667,13 @@ extern "C" fn render_callback(
     let channels = ctx.format.channels as usize;
     let samples_needed = frames * channels;
 
-    // 统计（降频，内部判断）- 在读取数据前进行
-    // 使用 AudioTimeStamp 的 host_time 提升时序精度
+    // 统计
     let host_time = unsafe { (*in_time_stamp).valid_host_time() };
     ctx.stats.on_callback_with_timestamp(&ctx.ring_buffer, host_time);
 
-    // 写入 AudioBufferList（根据 output_mode 选择路径）
+    // 调用共享的音频处理逻辑
     let buffer_list = unsafe { &mut *io_data };
-
-    if buffer_list.number_buffers > 0 {
-        match ctx.output_mode {
-            OutputFormatMode::Int32 => {
-                // 零拷贝路径：直接从 ring buffer 读取到输出缓冲区
-                // 避免中间 sample_buffer 拷贝，bit-perfect + 最短路径
-                let output_ptr = buffer_list.buffers[0].data as *mut i32;
-                let output_samples = buffer_list.buffers[0].data_byte_size as usize / 4;
-                let output_slice = unsafe { std::slice::from_raw_parts_mut(output_ptr, output_samples) };
-
-                let count = samples_needed.min(output_slice.len());
-
-                // 直接读取到输出缓冲区（零拷贝，bit-perfect）
-                let samples_read = ctx.ring_buffer.read(&mut output_slice[..count]);
-                ctx.stats.add_samples_played(samples_read as u64);
-
-                // 填零（数据不够或输出缓冲区更大）
-                for i in samples_read..output_slice.len() {
-                    output_slice[i] = 0;
-                }
-
-                // 记录 underrun（如果数据不够）
-                if samples_read < count {
-                    ctx.stats.record_underrun();
-                }
-            }
-            OutputFormatMode::Int24 => {
-                // Int24/Float32 需要通过 sample_buffer 进行格式转换
-                let actual_samples = samples_needed.min(ctx.sample_buffer.len());
-                let sample_buffer = &mut ctx.sample_buffer[..actual_samples];
-                let samples_read = ctx.ring_buffer.read(sample_buffer);
-                ctx.stats.add_samples_played(samples_read as u64);
-
-                // 数据不够则填零 + 记录 underrun
-                if samples_read < actual_samples {
-                    ctx.stats.record_underrun();
-                    for i in samples_read..actual_samples {
-                        sample_buffer[i] = 0;
-                    }
-                }
-
-                // 24-bit packed 输出
-                let output_ptr = buffer_list.buffers[0].data as *mut u8;
-                let output_bytes = buffer_list.buffers[0].data_byte_size as usize;
-                let output_slice = unsafe { std::slice::from_raw_parts_mut(output_ptr, output_bytes) };
-
-                let count = actual_samples.min(output_bytes / 3);
-
-                // 源 ≤24-bit: bit-perfect 直接截取
-                // 源 >24-bit: 需要 dither（量化损失）
-                if ctx.source_bits <= 24 {
-                    // Bit-perfect 路径：直接截取高 24 位
-                    for i in 0..count {
-                        let bytes = sample_buffer[i].to_le_bytes();
-                        output_slice[i * 3] = bytes[1];
-                        output_slice[i * 3 + 1] = bytes[2];
-                        output_slice[i * 3 + 2] = bytes[3];
-                    }
-                } else {
-                    // 有损路径：添加 TPDF dither
-                    for i in 0..count {
-                        let sample = sample_buffer[i];
-                        let r1 = (ctx.dither.next_u32() & 0xFF) as i32;
-                        let r2 = (ctx.dither.next_u32() & 0xFF) as i32;
-                        let dither = (r1 + r2 - 256) << 8;
-                        let dithered = sample.saturating_add(dither);
-
-                        let bytes = dithered.to_le_bytes();
-                        output_slice[i * 3] = bytes[1];
-                        output_slice[i * 3 + 1] = bytes[2];
-                        output_slice[i * 3 + 2] = bytes[3];
-                    }
-                }
-
-                for i in (count * 3)..output_bytes {
-                    output_slice[i] = 0;
-                }
-            }
-            OutputFormatMode::Float32 => {
-                // Float32 需要通过 sample_buffer 进行格式转换
-                let actual_samples = samples_needed.min(ctx.sample_buffer.len());
-                let sample_buffer = &mut ctx.sample_buffer[..actual_samples];
-                let samples_read = ctx.ring_buffer.read(sample_buffer);
-                ctx.stats.add_samples_played(samples_read as u64);
-
-                // 数据不够则填零 + 记录 underrun
-                if samples_read < actual_samples {
-                    ctx.stats.record_underrun();
-                    for i in samples_read..actual_samples {
-                        sample_buffer[i] = 0;
-                    }
-                }
-
-                // Float32 输出 + TPDF dither
-                let output_ptr = buffer_list.buffers[0].data as *mut f32;
-                let output_samples = buffer_list.buffers[0].data_byte_size as usize / 4;
-                let output_slice = unsafe { std::slice::from_raw_parts_mut(output_ptr, output_samples) };
-
-                const DITHER_SCALE: f32 = 1.0 / 8388608.0; // 2^-23
-                const I32_TO_FLOAT: f32 = 1.0 / 2147483648.0; // 1 / 2^31
-
-                let count = actual_samples.min(output_slice.len());
-
-                // SIMD 优化路径（4 样本一批）
-                #[cfg(target_arch = "aarch64")]
-                {
-                    use std::arch::aarch64::*;
-                    let scale_vec = unsafe { vdupq_n_f32(I32_TO_FLOAT) };
-
-                    let chunks = count / 4;
-                    for chunk_idx in 0..chunks {
-                        let i = chunk_idx * 4;
-                        unsafe {
-                            // 加载 4 个 i32 样本
-                            let i32x4 = vld1q_s32(sample_buffer.as_ptr().add(i));
-                            // 转换为 f32
-                            let f32x4 = vcvtq_f32_s32(i32x4);
-                            // 乘以缩放因子
-                            let scaled = vmulq_f32(f32x4, scale_vec);
-                            // 添加 dither（标量，因为 dither 需要状态）
-                            let mut result = [0.0f32; 4];
-                            vst1q_f32(result.as_mut_ptr(), scaled);
-                            for j in 0..4 {
-                                let dither = ctx.dither.next_tpdf() * DITHER_SCALE;
-                                output_slice[i + j] = result[j] + dither;
-                            }
-                        }
-                    }
-
-                    // 处理剩余样本
-                    for i in (chunks * 4)..count {
-                        let sample = sample_buffer[i] as f32 * I32_TO_FLOAT;
-                        let dither = ctx.dither.next_tpdf() * DITHER_SCALE;
-                        output_slice[i] = sample + dither;
-                    }
-                }
-
-                // 非 ARM64 的标量路径
-                #[cfg(not(target_arch = "aarch64"))]
-                {
-                    for i in 0..count {
-                        let sample = sample_buffer[i] as f32 * I32_TO_FLOAT;
-                        let dither = ctx.dither.next_tpdf() * DITHER_SCALE;
-                        output_slice[i] = sample + dither;
-                    }
-                }
-
-                for i in count..output_slice.len() {
-                    output_slice[i] = 0.0;
-                }
-            }
-        }
-    }
+    unsafe { process_audio_output(ctx, buffer_list, samples_needed); }
 
     NO_ERR
 }

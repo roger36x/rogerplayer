@@ -99,22 +99,29 @@ pub struct RingBuffer<T: Copy + Default> {
 
 **职责**：CoreAudio 设备管理和音频输出
 
-**输出模式优先级**：
+**后端优先级**：
+1. **IOProc** - 直接 HAL 层回调，绕过 AudioUnit，最短信号路径
+2. **HALOutput AudioUnit** - 绕过系统混音器，直接访问 USB DAC
+3. **DefaultOutput** - 通过系统混音器，用于蓝牙等设备
+
+**输出格式优先级**：
 1. **Physical Format (Int32)** - 直接硬件访问，bit-perfect
 2. **ASBD Integer (Int32/Int24)** - 通过 AudioUnit 整数输出
-3. **Float32 + TPDF Dither** - 回退路径（蓝牙、DefaultOutput）
+3. **Float32 + TPDF Dither** - 回退路径
 
 **关键技术**：
-- **HALOutput vs DefaultOutput**
-  - HALOutput: 绕过系统混音器，直接访问 USB DAC
-  - DefaultOutput: 通过系统混音器，用于蓝牙等设备
+- **IOProc vs AudioUnit**
+  - IOProc: `App → HAL → Hardware`（最短路径，延迟更低）
+  - AudioUnit: `App → AudioUnit → HAL → Hardware`
 - **Hog Mode**: 独占设备，防止其他应用干扰
 - **采样率智能选择**: 精确匹配 > 整数分频 > 最近值
 - **IO 线程实时调度**: `THREAD_TIME_CONSTRAINT_POLICY`
+- **设备能力查询**: buffer size range, latency, safety offset
 - **CoreAudio SRC**: 当源采样率与设备不匹配时，由 CoreAudio 自动处理采样率转换
 
-**回调函数 (`render_callback`)**：
+**回调函数**：
 ```rust
+// IOProc (直接 HAL) 或 render_callback (AudioUnit) 共享处理逻辑
 // 首次调用设置实时线程策略（只执行一次）
 if ctx.thread_policy_set.compare_exchange(...).is_ok() {
     ctx.set_realtime_thread_policy();
@@ -205,10 +212,12 @@ Stopped ──play()──→ Buffering ──prebuffer完成──→ Playing
 
 | 优化项 | 实现位置 | 说明 |
 |--------|----------|------|
+| **IOProc 直接 HAL 访问** | `output.rs` | 绕过 AudioUnit 层，最短回调路径 |
 | Lock-free SPSC Ring Buffer | `ring_buffer.rs` | 生产者/消费者完全无锁，wait-free |
 | CacheLine 对齐 | `ring_buffer.rs` | `#[repr(align(64))]` 避免 false sharing |
 | mlock 内存锁定 | `ring_buffer.rs`, `output.rs` | 防止 page fault 导致时序抖动 |
 | IO 线程实时调度 | `output.rs` | `THREAD_TIME_CONSTRAINT_POLICY` |
+| 设备能力查询 | `output.rs` | 查询 buffer range, latency, safety offset |
 | 解码线程优先级 | `engine/mod.rs` | `SCHED_RR:47` 或 `nice -10` 回退 |
 | 统计降频采样 | `stats.rs` | 每 16 次回调才采样，减少原子操作开销 |
 | Condvar 暂停机制 | `engine/mod.rs` | 零延迟唤醒，避免轮询 |
@@ -218,6 +227,7 @@ Stopped ──play()──→ Buffering ──prebuffer完成──→ Playing
 
 | 优化项 | 实现位置 | 说明 |
 |--------|----------|------|
+| **IOProc 直通** | `output.rs` | `App → HAL → Hardware`，绕过 AudioUnit 层 |
 | 物理格式输出 | `output.rs` | 直接设置 `kAudioStreamPropertyPhysicalFormat`，绕过系统格式转换 |
 | 零拷贝输出 (Int32) | `output.rs` | ring buffer → 输出缓冲区直接读取 |
 | 整数直通路径 | `decoder.rs` | PCM 整数源直接转 i32，避免 f64 中间表示 |

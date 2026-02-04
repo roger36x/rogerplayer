@@ -3,7 +3,7 @@
 //! 设计目标：
 //! - 零锁：生产者和消费者完全无锁操作
 //! - 零分配：所有内存在初始化时预分配
-//! - 缓存友好：使用 #[repr(align(64))] 避免 false sharing
+//! - 缓存友好：使用 cache line 对齐避免 false sharing
 //! - 内存锁定：可选 mlock 防止 page fault
 //!
 //! 用于解码线程（生产者）和音频输出线程（消费者）之间的数据传递
@@ -11,11 +11,19 @@
 use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+/// Cache line 大小
+///
+/// - Intel x86_64: 64 bytes
+/// - Apple Silicon (M1/M2/M3): 128 bytes (P-core)
+///
+/// 使用 128 bytes 以兼容 Apple Silicon，在 Intel 上略有浪费但无害
+pub const CACHE_LINE_SIZE: usize = 128;
+
 /// Cache line 对齐包装器
 ///
-/// 使用 #[repr(align(64))] 确保包装的值独占一个 cache line，
-/// 避免 false sharing
-#[repr(align(64))]
+/// 使用 #[repr(align(128))] 确保包装的值独占一个 cache line，
+/// 避免 false sharing。128 字节对齐兼容 Apple Silicon P-core。
+#[repr(C, align(128))]
 pub struct CacheLine<T>(pub T);
 
 impl<T> CacheLine<T> {
@@ -279,7 +287,31 @@ mod tests {
 
     #[test]
     fn test_cache_line_alignment() {
-        // 验证 CacheLine 确实是 64 字节对齐
-        assert_eq!(std::mem::align_of::<CacheLine<AtomicUsize>>(), 64);
+        // 验证 CacheLine 确实是 128 字节对齐（Apple Silicon 兼容）
+        assert_eq!(std::mem::align_of::<CacheLine<AtomicUsize>>(), 128);
+        // 验证大小也是 128 字节（完整占用一个 cache line）
+        assert_eq!(std::mem::size_of::<CacheLine<AtomicUsize>>(), 128);
+    }
+
+    #[test]
+    fn test_no_false_sharing() {
+        // 验证 write_pos 和 read_pos 在不同的 cache line
+        let rb = RingBuffer::<i32>::new(16);
+
+        let write_addr = &rb.write_pos as *const _ as usize;
+        let read_addr = &rb.read_pos as *const _ as usize;
+
+        // 两个位置的差距应该 >= 128 字节
+        let distance = if write_addr > read_addr {
+            write_addr - read_addr
+        } else {
+            read_addr - write_addr
+        };
+
+        assert!(
+            distance >= 128,
+            "write_pos and read_pos should be on different cache lines, distance: {}",
+            distance
+        );
     }
 }

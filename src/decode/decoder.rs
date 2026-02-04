@@ -158,13 +158,17 @@ impl AudioDecoder {
 
         let spec = SignalSpec::new(sample_rate, codec_params.channels.unwrap_or_default());
 
+        // 预分配 i32 缓冲区，避免播放时动态分配
+        // 8192 frames * 8 channels = 65536 samples（覆盖所有常见格式）
+        let i32_buffer = Vec::with_capacity(65536);
+
         Ok(Self {
             reader,
             decoder,
             track_id,
             info,
             sample_buffer: None,
-            i32_buffer: Vec::new(),
+            i32_buffer,
             spec,
         })
     }
@@ -258,7 +262,14 @@ impl AudioDecoder {
             let channels = decoded.spec().channels.count();
             let total_samples = frames * channels;
 
-            // 确保缓冲区容量足够
+            // 确保缓冲区长度足够（已预分配 65536 容量，正常情况不会触发分配）
+            // resize 在容量足够时只调整长度，不分配内存
+            debug_assert!(
+                self.i32_buffer.capacity() >= total_samples,
+                "Decoded packet ({} samples) exceeds pre-allocated capacity ({})",
+                total_samples,
+                self.i32_buffer.capacity()
+            );
             if self.i32_buffer.len() < total_samples {
                 self.i32_buffer.resize(total_samples, 0);
             }
@@ -339,14 +350,103 @@ impl AudioDecoder {
     }
 }
 
+/// 最大单次解码样本数（覆盖所有常见格式）
+/// 8192 frames * 8 channels = 65536 samples
+const MAX_SAMPLES_PER_DECODE: usize = 65536;
+
+/// 双缓冲结构，避免 copy_within
+struct DoubleBuffer {
+    buffers: [Vec<i32>; 2],
+    active: usize,
+    /// 当前缓冲区中的有效样本数
+    len: usize,
+    /// 当前读取位置
+    position: usize,
+}
+
+impl DoubleBuffer {
+    fn new() -> Self {
+        Self {
+            buffers: [
+                Vec::with_capacity(MAX_SAMPLES_PER_DECODE * 2),
+                Vec::with_capacity(MAX_SAMPLES_PER_DECODE * 2),
+            ],
+            active: 0,
+            len: 0,
+            position: 0,
+        }
+    }
+
+    /// 获取可读取的样本数
+    #[inline]
+    fn available(&self) -> usize {
+        self.len - self.position
+    }
+
+    /// 读取指定数量的样本（返回切片）
+    #[inline]
+    fn read(&mut self, count: usize) -> &[i32] {
+        let available = self.available();
+        let to_read = count.min(available);
+        let start = self.position;
+        self.position += to_read;
+        &self.buffers[self.active][start..start + to_read]
+    }
+
+    /// 切换到另一个缓冲区并追加数据
+    /// 将当前缓冲区剩余数据复制到新缓冲区，然后追加新数据
+    fn swap_and_append(&mut self, new_data: &[i32]) {
+        let remaining = self.available();
+        let next = 1 - self.active;
+        let current = self.active;
+        let pos = self.position;
+        let len = self.len;
+
+        // 确保目标缓冲区容量足够
+        let needed = remaining + new_data.len();
+        if self.buffers[next].capacity() < needed {
+            self.buffers[next].reserve(needed - self.buffers[next].capacity());
+        }
+
+        // 使用 split_at_mut 来同时获取两个缓冲区的可变引用
+        let (first, second) = self.buffers.split_at_mut(1);
+        let (src_buf, dst_buf) = if current == 0 {
+            (&first[0], &mut second[0])
+        } else {
+            (&second[0], &mut first[0])
+        };
+
+        // 清空目标缓冲区并复制剩余数据
+        dst_buf.clear();
+        if remaining > 0 {
+            dst_buf.extend_from_slice(&src_buf[pos..len]);
+        }
+        // 追加新数据
+        dst_buf.extend_from_slice(new_data);
+
+        // 切换
+        self.active = next;
+        self.len = self.buffers[next].len();
+        self.position = 0;
+    }
+
+    /// 直接追加数据到当前缓冲区（当缓冲区为空时使用）
+    fn append(&mut self, data: &[i32]) {
+        let buf = &mut self.buffers[self.active];
+        buf.clear();
+        buf.extend_from_slice(data);
+        self.len = buf.len();
+        self.position = 0;
+    }
+}
+
 /// 简单的解码器迭代器，用于流式解码
 pub struct DecoderIterator {
     decoder: AudioDecoder,
     buffer: Vec<f64>,
     position: usize,
-    /// i32 缓冲区（整数直通路径）
-    i32_buffer: Vec<i32>,
-    i32_position: usize,
+    /// 双缓冲（整数直通路径）- 避免 copy_within
+    double_buffer: DoubleBuffer,
 }
 
 impl DecoderIterator {
@@ -355,8 +455,7 @@ impl DecoderIterator {
             decoder,
             buffer: Vec::new(),
             position: 0,
-            i32_buffer: Vec::new(),
-            i32_position: 0,
+            double_buffer: DoubleBuffer::new(),
         }
     }
 
@@ -394,43 +493,44 @@ impl DecoderIterator {
     ///
     /// 对于整数源格式，避免 f64 中间转换
     /// 返回的样本已左对齐到 i32 高位
+    ///
+    /// 使用双缓冲避免 copy_within，减少热路径开销
     pub fn read_i32(&mut self, count: usize) -> Result<&[i32], DecodeError> {
-        // 如果当前缓冲区有足够数据，直接返回切片
-        let available = self.i32_buffer.len() - self.i32_position;
-        if available >= count {
-            let start = self.i32_position;
-            self.i32_position += count;
-            return Ok(&self.i32_buffer[start..start + count]);
+        // 如果当前缓冲区有足够数据，直接返回切片（零拷贝快速路径）
+        if self.double_buffer.available() >= count {
+            return Ok(self.double_buffer.read(count));
         }
 
         // 需要解码更多数据
-        // 先将剩余数据移到开头
-        if self.i32_position > 0 && available > 0 {
-            self.i32_buffer.copy_within(self.i32_position.., 0);
-            self.i32_buffer.truncate(available);
-        } else {
-            self.i32_buffer.clear();
-        }
-        self.i32_position = 0;
-
-        // 解码直到有足够数据
-        while self.i32_buffer.len() < count {
-            let samples = self.decoder.decode_next_i32()?;
-            if samples.is_empty() {
-                break; // EOF
+        // 解码一批数据
+        let samples = self.decoder.decode_next_i32()?;
+        if samples.is_empty() {
+            // EOF - 返回剩余数据
+            let remaining = self.double_buffer.available();
+            if remaining > 0 {
+                return Ok(self.double_buffer.read(remaining));
             }
-            self.i32_buffer.extend_from_slice(samples);
+            return Ok(&[]);
         }
 
-        // 返回可用数据
-        let to_return = self.i32_buffer.len().min(count);
-        self.i32_position = to_return;
-        Ok(&self.i32_buffer[..to_return])
+        // 使用双缓冲策略
+        if self.double_buffer.available() == 0 {
+            // 缓冲区已空，直接使用新数据
+            self.double_buffer.append(samples);
+        } else {
+            // 还有剩余数据，交换缓冲区并合并
+            self.double_buffer.swap_and_append(samples);
+        }
+
+        // 返回请求的数据量（或全部可用数据）
+        let to_return = self.double_buffer.available().min(count);
+        Ok(self.double_buffer.read(to_return))
     }
 
     /// 检查是否到达文件末尾
     pub fn is_eof(&self) -> bool {
         self.position >= self.buffer.len() && self.buffer.is_empty()
+            && self.double_buffer.available() == 0
     }
 }
 

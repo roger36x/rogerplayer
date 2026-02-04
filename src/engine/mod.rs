@@ -5,7 +5,7 @@
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
 use crate::audio::{AudioFormat, AudioOutput, OutputConfig, PlaybackStats, RingBuffer};
@@ -91,6 +91,8 @@ pub struct EngineStats {
 }
 
 /// 解码线程共享状态
+///
+/// 完全基于原子操作，无锁设计
 struct DecoderState {
     /// 是否应该继续运行
     running: AtomicBool,
@@ -100,10 +102,6 @@ struct DecoderState {
     eof_reached: AtomicBool,
     /// 已解码样本数
     samples_decoded: AtomicU64,
-    /// 用于暂停/恢复通知的 Condvar
-    pause_cond: Condvar,
-    /// Condvar 所需的 Mutex（只在暂停时使用，不影响热路径）
-    pause_mutex: Mutex<()>,
 }
 
 /// 播放引擎
@@ -131,8 +129,6 @@ impl Engine {
             paused: AtomicBool::new(false),
             eof_reached: AtomicBool::new(false),
             samples_decoded: AtomicU64::new(0),
-            pause_cond: Condvar::new(),
-            pause_mutex: Mutex::new(()),
         });
 
         Self {
@@ -272,13 +268,20 @@ impl Engine {
         );
 
         while state.running.load(Ordering::Acquire) {
-            // 检查暂停 - 使用 Condvar 等待，响应延迟 ~0
+            // 检查暂停 - 使用 spin + yield 等待，完全无锁
+            // 比 Condvar 更简单，避免 Mutex 的优先级反转风险
             if state.paused.load(Ordering::Acquire) {
-                let guard = state.pause_mutex.lock().unwrap();
-                // 再次检查，避免丢失通知
-                if state.paused.load(Ordering::Acquire) && state.running.load(Ordering::Acquire) {
-                    // 使用带超时的 wait，以便定期检查 running 状态
-                    let _ = state.pause_cond.wait_timeout(guard, std::time::Duration::from_millis(100));
+                // 短暂自旋（适合极短暂停）
+                for _ in 0..16 {
+                    std::hint::spin_loop();
+                    if !state.paused.load(Ordering::Relaxed) {
+                        break;
+                    }
+                }
+                // 仍在暂停则让出 CPU 并短暂睡眠
+                if state.paused.load(Ordering::Acquire) {
+                    thread::yield_now();
+                    thread::sleep(std::time::Duration::from_millis(10));
                 }
                 continue;
             }
@@ -369,8 +372,8 @@ impl Engine {
     pub fn stop(&mut self) -> Result<(), EngineError> {
         // 停止解码线程
         self.decoder_state.running.store(false, Ordering::Release);
-        // 唤醒可能在等待的解码线程
-        self.decoder_state.pause_cond.notify_one();
+        // 解除暂停状态（如果有），确保解码线程能退出
+        self.decoder_state.paused.store(false, Ordering::Release);
 
         if let Some(thread) = self.decoder_thread.take() {
             let _ = thread.join();
@@ -393,16 +396,32 @@ impl Engine {
 
     /// 暂停/恢复
     pub fn toggle_pause(&mut self) -> Result<(), EngineError> {
+        // 先同步状态：如果缓冲已完成但内部状态仍是 Buffering，更新为 Playing
+        if self.state == PlaybackState::Buffering {
+            let fill_ratio = self.ring_buffer.fill_ratio();
+            if fill_ratio >= self.config.prebuffer_ratio {
+                self.state = PlaybackState::Playing;
+            }
+        }
+
         match self.state {
             PlaybackState::Playing => {
+                // 暂停解码线程
                 self.decoder_state.paused.store(true, Ordering::Release);
+                // 暂停音频输出（立即静音）
+                if let Some(ref mut output) = self.output {
+                    output.pause()?;
+                }
                 self.state = PlaybackState::Paused;
                 log::info!("Paused");
             }
             PlaybackState::Paused | PlaybackState::Buffering => {
+                // 恢复音频输出
+                if let Some(ref mut output) = self.output {
+                    output.resume()?;
+                }
+                // 恢复解码线程（原子写入，解码线程会在下次循环检测到）
                 self.decoder_state.paused.store(false, Ordering::Release);
-                // 通知解码线程恢复 - 响应延迟从 ~10ms 降到 ~0
-                self.decoder_state.pause_cond.notify_one();
                 self.state = PlaybackState::Playing;
                 log::info!("Resumed");
             }
