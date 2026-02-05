@@ -8,7 +8,10 @@ use crossterm::{
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
 
-use super::{model::App, view};
+use super::{
+    model::{App, DialogState},
+    view,
+};
 
 /// TUI 运行入口
 pub fn run(mut app: App) -> io::Result<()> {
@@ -42,8 +45,34 @@ pub fn run(mut app: App) -> io::Result<()> {
         if crossterm::event::poll(timeout)? {
             if let Event::Key(key) = event::read()? {
                 if key.kind == KeyEventKind::Press {
+                    // 弹窗模式优先处理
+                    if !matches!(app.dialog, DialogState::None) {
+                        match key.code {
+                            KeyCode::Up | KeyCode::Char('k') => {
+                                app.dialog_select_up();
+                            }
+                            KeyCode::Down | KeyCode::Char('j') => {
+                                app.dialog_select_down();
+                            }
+                            KeyCode::Char('1') => {
+                                app.dialog_select_option(0);
+                                app.dialog_confirm();
+                            }
+                            KeyCode::Char('2') => {
+                                app.dialog_select_option(1);
+                                app.dialog_confirm();
+                            }
+                            KeyCode::Enter => {
+                                app.dialog_confirm();
+                            }
+                            KeyCode::Esc => {
+                                app.dialog_cancel();
+                            }
+                            _ => {}
+                        }
+                    }
                     // 输入模式下的按键处理
-                    if app.input_mode {
+                    else if app.input_mode {
                         match key.code {
                             KeyCode::Enter => {
                                 if !app.path_input.is_empty() {

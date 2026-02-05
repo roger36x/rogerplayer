@@ -849,6 +849,16 @@ impl AudioOutput {
         })
     }
 
+    /// 检查默认输出设备是否是蓝牙设备
+    ///
+    /// 用于在播放前决定是否显示输出模式选择弹窗
+    pub fn is_default_device_bluetooth() -> bool {
+        match Self::get_default_device() {
+            Ok(info) => info.is_bluetooth,
+            Err(_) => false, // 获取失败时默认返回 false
+        }
+    }
+
     /// 获取所有输出设备
     pub fn get_all_output_devices() -> Result<Vec<DeviceInfo>, OutputError> {
         // 获取设备列表大小

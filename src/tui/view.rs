@@ -2,11 +2,11 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, Paragraph},
+    widgets::{Block, Borders, Clear, List, ListItem, Paragraph},
     Frame,
 };
 
-use super::model::{App, RepeatMode};
+use super::model::{App, DialogState, OutputModeChoice, RepeatMode};
 use crate::engine::PlaybackState;
 
 pub fn draw(f: &mut Frame, app: &mut App) {
@@ -25,6 +25,11 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     draw_main(f, app, chunks[1]);
     draw_logs(f, app, chunks[2]);
     draw_footer(f, app, chunks[3]);
+
+    // 如果有弹窗，渲染在最上层
+    if !matches!(app.dialog, DialogState::None) {
+        draw_dialog(f, app);
+    }
 }
 
 fn draw_header(f: &mut Frame, app: &App, area: Rect) {
@@ -321,7 +326,9 @@ fn draw_logs(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
-    let info = if app.input_mode {
+    let info = if !matches!(app.dialog, DialogState::None) {
+        "↑/↓: Select | Enter: Confirm | Esc: Cancel"
+    } else if app.input_mode {
         "Enter: Load | Esc: Cancel | q: Quit"
     } else {
         "SPACE: Pause | n/p: Next/Prev | s: Shuffle | r: Repeat | o: Open | q: Quit"
@@ -331,4 +338,87 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
         .block(block)
         .style(Style::default().fg(Color::DarkGray));
     f.render_widget(paragraph, area);
+}
+
+/// 渲染弹窗（居中显示）
+fn draw_dialog(f: &mut Frame, app: &App) {
+    if let DialogState::OutputModeSelect { selected, .. } = &app.dialog {
+        let area = f.size();
+
+        // 弹窗尺寸
+        let dialog_width = 50u16.min(area.width.saturating_sub(4));
+        let dialog_height = 10u16.min(area.height.saturating_sub(4));
+
+        // 居中计算
+        let x = (area.width.saturating_sub(dialog_width)) / 2;
+        let y = (area.height.saturating_sub(dialog_height)) / 2;
+
+        let dialog_area = Rect::new(x, y, dialog_width, dialog_height);
+
+        // 清除弹窗区域的背景内容
+        f.render_widget(Clear, dialog_area);
+
+        // 弹窗边框（带黑色背景填充）
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan))
+            .style(Style::default().bg(Color::Black))
+            .title(" Select Output Mode ");
+
+        f.render_widget(block, dialog_area);
+
+        // 内部区域
+        let inner = Rect {
+            x: dialog_area.x + 2,
+            y: dialog_area.y + 1,
+            width: dialog_area.width.saturating_sub(4),
+            height: dialog_area.height.saturating_sub(2),
+        };
+
+        let mut lines = Vec::new();
+
+        // 说明文字
+        lines.push(Line::from(Span::styled(
+            "Choose audio output mode:",
+            Style::default().fg(Color::White),
+        )));
+        lines.push(Line::from(""));
+
+        // 选项 1: HAL Exclusive
+        let hal_style = if *selected == OutputModeChoice::HalExclusive {
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        let hal_prefix = if *selected == OutputModeChoice::HalExclusive { "> " } else { "  " };
+        lines.push(Line::from(Span::styled(
+            format!("{}[1] HAL Output (Exclusive)", hal_prefix),
+            hal_style,
+        )));
+        lines.push(Line::from(Span::styled(
+            "      Best quality, bit-perfect",
+            Style::default().fg(Color::DarkGray),
+        )));
+
+        lines.push(Line::from(""));
+
+        // 选项 2: System Mixer
+        let mixer_style = if *selected == OutputModeChoice::SystemMixer {
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        let mixer_prefix = if *selected == OutputModeChoice::SystemMixer { "> " } else { "  " };
+        lines.push(Line::from(Span::styled(
+            format!("{}[2] System Mixer", mixer_prefix),
+            mixer_style,
+        )));
+        lines.push(Line::from(Span::styled(
+            "      Compatible, allows mixing",
+            Style::default().fg(Color::DarkGray),
+        )));
+
+        let paragraph = Paragraph::new(lines);
+        f.render_widget(paragraph, inner);
+    }
 }

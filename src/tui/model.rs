@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 
 use rand::seq::SliceRandom;
 
+use crate::audio::AudioOutput;
 use crate::engine::{Engine, EngineConfig, EngineStats};
 
 /// 支持的音频文件扩展名
@@ -16,6 +17,26 @@ pub enum RepeatMode {
     Off,   // 播放完列表后停止
     All,   // 列表循环
     Track, // 单曲循环
+}
+
+/// 输出模式选择
+#[derive(Clone, Copy, PartialEq, Default)]
+pub enum OutputModeChoice {
+    #[default]
+    HalExclusive,  // HAL 独占模式（最高音质）
+    SystemMixer,   // 系统混音器（兼容性好）
+}
+
+/// 弹窗状态
+#[derive(Clone, Default)]
+pub enum DialogState {
+    #[default]
+    None,
+    /// 输出模式选择弹窗，包含待加载的路径
+    OutputModeSelect {
+        pending_path: String,
+        selected: OutputModeChoice,
+    },
 }
 
 /// TUI 应用状态
@@ -61,6 +82,9 @@ pub struct App {
 
     /// 上次切歌时间（防抖用，防止快速切歌导致 AudioUnit 错误）
     last_switch_time: Option<Instant>,
+
+    /// 弹窗状态
+    pub dialog: DialogState,
 }
 
 /// 切歌防抖间隔（毫秒）
@@ -97,6 +121,7 @@ impl App {
             repeat_mode: RepeatMode::default(),
             shuffle_order,
             last_switch_time: None,
+            dialog: DialogState::None,
         }
     }
 
@@ -106,19 +131,49 @@ impl App {
     }
 
     /// 从路径加载播放列表
+    ///
+    /// 如果不是蓝牙设备，会先显示输出模式选择弹窗
     pub fn load_path(&mut self, path_str: &str) {
         // 清理路径字符串
-        // 1. 去除首尾空白
-        // 2. 去除首尾引号
-        // 3. 处理 shell 转义字符（macOS Terminal 拖拽文件时会转义空格等）
         let path_str = path_str.trim().trim_matches(|c| c == '\'' || c == '"');
         let path_str = Self::unescape_shell_path(path_str);
         let path = PathBuf::from(&path_str);
 
+        // 先验证路径是否有效
         if !path.exists() {
             self.log(format!("Path not found: {}", path_str));
             return;
         }
+
+        // 检查是否是支持的音频文件或目录
+        if !path.is_dir() && !Self::is_audio_file(&path) {
+            self.log(format!("Not a supported audio file: {}", path_str));
+            return;
+        }
+
+        // 退出输入模式
+        self.input_mode = false;
+        self.path_input.clear();
+
+        // 检测是否是蓝牙设备
+        if AudioOutput::is_default_device_bluetooth() {
+            // 蓝牙设备：直接使用系统混音器，不显示弹窗
+            self.config.output.use_hal = false;
+            self.config.output.exclusive_mode = false;
+            self.log("Bluetooth device detected, using System Mixer".to_string());
+            self.do_load_path(&path_str);
+        } else {
+            // 非蓝牙设备：显示输出模式选择弹窗
+            self.dialog = DialogState::OutputModeSelect {
+                pending_path: path_str,
+                selected: OutputModeChoice::HalExclusive, // 默认选中 HAL
+            };
+        }
+    }
+
+    /// 实际执行路径加载（弹窗确认后调用）
+    fn do_load_path(&mut self, path_str: &str) {
+        let path = PathBuf::from(path_str);
 
         let files = if path.is_dir() {
             match Self::scan_audio_files(&path) {
@@ -144,8 +199,6 @@ impl App {
         self.playlist = files;
         self.current_index = 0;
         self.playlist_state.select(Some(0));
-        self.input_mode = false;
-        self.path_input.clear();
 
         // 重新生成 shuffle 顺序
         if self.shuffle {
@@ -383,6 +436,63 @@ impl App {
             RepeatMode::Track => "TRACK",
         };
         self.log(format!("Repeat: {}", mode_str));
+    }
+
+    // ========== 弹窗相关方法 ==========
+
+    /// 弹窗选择向上
+    pub fn dialog_select_up(&mut self) {
+        if let DialogState::OutputModeSelect { selected, .. } = &mut self.dialog {
+            *selected = OutputModeChoice::HalExclusive;
+        }
+    }
+
+    /// 弹窗选择向下
+    pub fn dialog_select_down(&mut self) {
+        if let DialogState::OutputModeSelect { selected, .. } = &mut self.dialog {
+            *selected = OutputModeChoice::SystemMixer;
+        }
+    }
+
+    /// 弹窗选择指定选项（0: HAL, 1: Mixer）
+    pub fn dialog_select_option(&mut self, index: usize) {
+        if let DialogState::OutputModeSelect { selected, .. } = &mut self.dialog {
+            *selected = if index == 0 {
+                OutputModeChoice::HalExclusive
+            } else {
+                OutputModeChoice::SystemMixer
+            };
+        }
+    }
+
+    /// 确认弹窗选择
+    pub fn dialog_confirm(&mut self) {
+        if let DialogState::OutputModeSelect { pending_path, selected } = &self.dialog {
+            let path = pending_path.clone();
+            let use_hal = *selected == OutputModeChoice::HalExclusive;
+
+            // 更新配置
+            self.config.output.use_hal = use_hal;
+            self.config.output.exclusive_mode = use_hal;
+
+            // 重新创建引擎（使用新配置）
+            self.engine = Engine::new(self.config.clone());
+
+            let mode_str = if use_hal { "HAL (Exclusive)" } else { "System Mixer" };
+            self.log(format!("Output mode: {}", mode_str));
+
+            // 关闭弹窗
+            self.dialog = DialogState::None;
+
+            // 执行实际加载
+            self.do_load_path(&path);
+        }
+    }
+
+    /// 取消弹窗
+    pub fn dialog_cancel(&mut self) {
+        self.dialog = DialogState::None;
+        self.log("Cancelled".to_string());
     }
 
     /// 生成随机播放顺序
