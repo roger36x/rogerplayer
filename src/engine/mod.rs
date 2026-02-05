@@ -365,31 +365,106 @@ impl Engine {
 
     /// 设置解码线程优先级
     ///
-    /// 使用 pthread 设置较高优先级，但保持低于 CoreAudio IO 线程
+    /// 优化策略（按优先级顺序）：
+    /// 1. QoS 标记 - 告诉系统这是用户交互敏感任务（总是成功）
+    /// 2. 实时调度策略 - 使用 Mach THREAD_TIME_CONSTRAINT_POLICY（不需要 root）
+    /// 3. 后备方案 - nice 值
     fn set_decoder_thread_priority() {
         #[cfg(target_os = "macos")]
         {
-            use libc::{pthread_self, pthread_setschedparam, sched_param, SCHED_RR};
+            // === 1. 设置 QoS 类（总是成功，无需权限）===
+            Self::set_qos_class();
 
-            unsafe {
-                let thread = pthread_self();
-                let mut param: sched_param = std::mem::zeroed();
-                // 使用较高优先级（但不是最高，避免影响 IO 线程）
-                // SCHED_RR 的优先级范围通常是 1-99
-                param.sched_priority = 47;
+            // === 2. 设置实时调度策略（不需要 root）===
+            Self::set_realtime_priority();
+        }
+    }
 
-                let result = pthread_setschedparam(thread, SCHED_RR, &param);
-                if result == 0 {
-                    log::debug!("Decoder thread priority set to SCHED_RR:47");
-                } else {
-                    // 如果失败（通常需要 root 权限），尝试提升到最高普通优先级
-                    log::debug!(
-                        "Failed to set realtime priority (errno: {}), falling back to nice",
-                        result
-                    );
-                    // 设置 nice 值为 -10（较高优先级）
-                    libc::setpriority(libc::PRIO_PROCESS, 0, -10);
-                }
+    /// 设置 QoS 类为 User Interactive
+    ///
+    /// 告诉系统调度器这是用户交互敏感任务，减少被抢占概率
+    #[cfg(target_os = "macos")]
+    fn set_qos_class() {
+        // QOS_CLASS_USER_INTERACTIVE = 0x21
+        const QOS_CLASS_USER_INTERACTIVE: u32 = 0x21;
+
+        extern "C" {
+            fn pthread_set_qos_class_self_np(qos_class: u32, relative_priority: i32) -> i32;
+        }
+
+        unsafe {
+            let result = pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+            if result == 0 {
+                log::debug!("QoS class set to USER_INTERACTIVE");
+            } else {
+                log::debug!("Failed to set QoS class (errno: {})", result);
+            }
+        }
+    }
+
+    /// 设置 Mach 实时调度策略
+    ///
+    /// 使用 THREAD_TIME_CONSTRAINT_POLICY 告诉调度器：
+    /// - period: 解码周期（5ms）
+    /// - computation: 每周期需要的计算时间（2ms）
+    /// - constraint: 最大延迟容忍（4ms）
+    ///
+    /// 这不需要 root 权限，系统会尽量满足请求
+    #[cfg(target_os = "macos")]
+    fn set_realtime_priority() {
+        #[repr(C)]
+        struct ThreadTimeConstraintPolicy {
+            period: u32,
+            computation: u32,
+            constraint: u32,
+            preemptible: u32,
+        }
+
+        const THREAD_TIME_CONSTRAINT_POLICY: u32 = 2;
+
+        extern "C" {
+            fn pthread_mach_thread_np(thread: libc::pthread_t) -> u32;
+            fn thread_policy_set(
+                thread: u32,
+                flavor: u32,
+                policy_info: *const std::ffi::c_void,
+                count: u32,
+            ) -> i32;
+        }
+
+        unsafe {
+            let thread = pthread_mach_thread_np(libc::pthread_self());
+
+            // 时间约束策略（单位：Mach 绝对时间，约等于纳秒）
+            // period: 5ms - 解码周期
+            // computation: 2ms - 每周期需要的计算时间
+            // constraint: 4ms - 必须在这个时间内完成
+            let policy = ThreadTimeConstraintPolicy {
+                period: 5_000_000,       // 5ms
+                computation: 2_000_000,  // 2ms
+                constraint: 4_000_000,   // 4ms
+                preemptible: 1,          // 可被更高优先级抢占
+            };
+
+            // count = struct 中 u32 的数量
+            let result = thread_policy_set(
+                thread,
+                THREAD_TIME_CONSTRAINT_POLICY,
+                &policy as *const _ as *const std::ffi::c_void,
+                4,
+            );
+
+            if result == 0 {
+                log::debug!(
+                    "Realtime priority set: period=5ms, computation=2ms, constraint=4ms"
+                );
+            } else {
+                log::debug!(
+                    "Failed to set realtime priority (kern_return: {}), using default scheduling",
+                    result
+                );
+                // 后备方案：设置 nice 值
+                libc::setpriority(libc::PRIO_PROCESS, 0, -10);
             }
         }
     }
