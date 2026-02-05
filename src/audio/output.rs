@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 
 use super::format::{AudioFormat, OutputLayout};
-use super::ring_buffer::RingBuffer;
+use super::ring_buffer::{CacheLine, RingBuffer};
 use super::stats::PlaybackStats;
 
 /// Core Audio 类型定义
@@ -522,10 +522,13 @@ pub struct CallbackContext {
     pub source_bits: u16,
 
     /// 是否正在运行
-    pub running: AtomicBool,
+    /// 使用 CacheLine 包装避免与 thread_policy_set 的 false sharing
+    /// （running 被外部线程写入，thread_policy_set 被回调线程读写）
+    pub running: CacheLine<AtomicBool>,
 
     /// IO 线程是否已设置时间约束策略
-    pub thread_policy_set: AtomicBool,
+    /// 使用 CacheLine 包装确保独占缓存行
+    pub thread_policy_set: CacheLine<AtomicBool>,
 }
 
 /// Mach 线程策略相关类型和常量
@@ -2046,8 +2049,8 @@ impl AudioOutput {
             dither: DitherState::new(dither_seed),
             output_mode,
             source_bits: format.bits_per_sample,
-            running: AtomicBool::new(true),
-            thread_policy_set: AtomicBool::new(false),
+            running: CacheLine::new(AtomicBool::new(true)),
+            thread_policy_set: CacheLine::new(AtomicBool::new(false)),
         });
 
         // 锁定关键内存，防止 page fault
@@ -2168,7 +2171,7 @@ impl AudioOutput {
     /// 停止输出
     pub fn stop(&mut self) -> Result<(), OutputError> {
         if let Some(ref context) = self.context {
-            context.running.store(false, Ordering::Release);
+            context.running.0.store(false, Ordering::Release);
         }
 
         let audio_unit = self.backend.audio_unit;
@@ -2201,7 +2204,7 @@ impl AudioOutput {
     pub fn is_running(&self) -> bool {
         self.context
             .as_ref()
-            .map(|c| c.running.load(Ordering::Acquire))
+            .map(|c| c.running.0.load(Ordering::Acquire))
             .unwrap_or(false)
     }
 
@@ -2458,12 +2461,12 @@ extern "C" fn render_callback(
 ) -> OSStatus {
     let ctx = unsafe { &mut *(in_ref_con as *mut CallbackContext) };
 
-    if !ctx.running.load(Ordering::Acquire) {
+    if !ctx.running.0.load(Ordering::Acquire) {
         return NO_ERR;
     }
 
     // 首次调用时设置 IO 线程的实时调度策略
-    if ctx.thread_policy_set
+    if ctx.thread_policy_set.0
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .is_ok()
     {

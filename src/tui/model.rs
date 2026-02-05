@@ -1,5 +1,6 @@
 use std::ffi::OsStr;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use rand::seq::SliceRandom;
 
@@ -57,7 +58,13 @@ pub struct App {
 
     /// 随机播放顺序（shuffle 模式下使用）
     shuffle_order: Vec<usize>,
+
+    /// 上次切歌时间（防抖用，防止快速切歌导致 AudioUnit 错误）
+    last_switch_time: Option<Instant>,
 }
+
+/// 切歌防抖间隔（毫秒）
+const TRACK_SWITCH_DEBOUNCE_MS: u64 = 200;
 
 impl App {
     pub fn new(config: EngineConfig, playlist: Vec<PathBuf>) -> Self {
@@ -89,6 +96,7 @@ impl App {
             shuffle: false,
             repeat_mode: RepeatMode::default(),
             shuffle_order,
+            last_switch_time: None,
         }
     }
 
@@ -234,6 +242,13 @@ impl App {
             return;
         }
 
+        // 防抖：防止快速切歌导致 AudioUnit 状态错误
+        if let Some(last_time) = self.last_switch_time {
+            if last_time.elapsed() < Duration::from_millis(TRACK_SWITCH_DEBOUNCE_MS) {
+                return;
+            }
+        }
+
         // 单曲循环模式下，手动按 next 仍然切到下一首
         self.go_to_next(false);
     }
@@ -295,6 +310,13 @@ impl App {
             return;
         }
 
+        // 防抖：防止快速切歌导致 AudioUnit 状态错误
+        if let Some(last_time) = self.last_switch_time {
+            if last_time.elapsed() < Duration::from_millis(TRACK_SWITCH_DEBOUNCE_MS) {
+                return;
+            }
+        }
+
         let prev_index = if self.shuffle {
             // Shuffle 模式：找到当前在 shuffle_order 中的位置，然后取上一个
             if let Some(pos) = self.current_shuffle_position() {
@@ -325,6 +347,9 @@ impl App {
     /// 播放当前选中的曲目
     pub fn play_current(&mut self) {
         if self.current_index < self.playlist.len() {
+            // 更新切歌时间戳（用于防抖）
+            self.last_switch_time = Some(Instant::now());
+
             let path = &self.playlist[self.current_index];
             if let Err(e) = self.engine.play(path) {
                 self.log(format!("Error playing: {}", e));

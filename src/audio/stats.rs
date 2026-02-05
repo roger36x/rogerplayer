@@ -4,7 +4,7 @@
 
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
-use super::ring_buffer::RingBuffer;
+use super::ring_buffer::{CacheLine, RingBuffer};
 use super::timing::{mach_ticks_to_ns, now_ticks};
 
 /// 统计采样间隔：每 N 次 callback 才采样一次
@@ -16,35 +16,40 @@ const TIMESTAMP_BUFFER_SIZE: usize = 256;
 /// 播放统计收集器
 ///
 /// 所有操作都是 lock-free 的，适合在音频回调中使用
+///
+/// 内存布局优化：
+/// - 高频写入字段使用 CacheLine 包装避免 false sharing
+/// - callback_count 和 samples_played 每次回调都会更新
+/// - underrun_count 在 underrun 事件时更新
 pub struct PlaybackStats {
-    callback_count: AtomicU64,
+    // 高频写入字段 - 每次回调都会更新，独立缓存行避免 false sharing
+    callback_count: CacheLine<AtomicU64>,
+    samples_played: CacheLine<AtomicU64>,
+    underrun_count: CacheLine<AtomicU64>,
+
+    // 中频字段 - 每 SAMPLE_INTERVAL 次回调更新一次
     last_sampled_ticks: AtomicU64,
+    interval_write_idx: AtomicUsize,
+    water_level_write_idx: AtomicUsize,
 
     // 存储 interval（单位：mach ticks，后处理时转换）
     interval_buffer: Box<[AtomicU64; TIMESTAMP_BUFFER_SIZE]>,
-    interval_write_idx: AtomicUsize,
 
     // 水位（也降频采样）
     water_level_buffer: Box<[AtomicUsize; TIMESTAMP_BUFFER_SIZE]>,
-    water_level_write_idx: AtomicUsize,
-
-    underrun_count: AtomicU64,
-
-    // 已播放样本数
-    samples_played: AtomicU64,
 }
 
 impl PlaybackStats {
     pub fn new() -> Self {
         Self {
-            callback_count: AtomicU64::new(0),
+            callback_count: CacheLine::new(AtomicU64::new(0)),
+            samples_played: CacheLine::new(AtomicU64::new(0)),
+            underrun_count: CacheLine::new(AtomicU64::new(0)),
             last_sampled_ticks: AtomicU64::new(0),
-            interval_buffer: Box::new(std::array::from_fn(|_| AtomicU64::new(0))),
             interval_write_idx: AtomicUsize::new(0),
-            water_level_buffer: Box::new(std::array::from_fn(|_| AtomicUsize::new(0))),
             water_level_write_idx: AtomicUsize::new(0),
-            underrun_count: AtomicU64::new(0),
-            samples_played: AtomicU64::new(0),
+            interval_buffer: Box::new(std::array::from_fn(|_| AtomicU64::new(0))),
+            water_level_buffer: Box::new(std::array::from_fn(|_| AtomicUsize::new(0))),
         }
     }
 
@@ -56,7 +61,7 @@ impl PlaybackStats {
     /// 只在采样点才读 now + water_level，减少开销
     #[inline]
     pub fn on_callback_with_timestamp(&self, ring_buffer: &RingBuffer<i32>, host_time: u64) {
-        let count = self.callback_count.fetch_add(1, Ordering::Relaxed);
+        let count = self.callback_count.0.fetch_add(1, Ordering::Relaxed);
 
         // 只在采样点才做额外工作
         if count.is_multiple_of(SAMPLE_INTERVAL) {
@@ -90,31 +95,31 @@ impl PlaybackStats {
     /// 记录 underrun
     #[inline]
     pub fn record_underrun(&self) {
-        self.underrun_count.fetch_add(1, Ordering::Relaxed);
+        self.underrun_count.0.fetch_add(1, Ordering::Relaxed);
     }
 
     /// 更新已播放样本数
     #[inline]
     pub fn add_samples_played(&self, samples: u64) {
-        self.samples_played.fetch_add(samples, Ordering::Relaxed);
+        self.samples_played.0.fetch_add(samples, Ordering::Relaxed);
     }
 
     /// 获取 underrun 计数
     #[inline]
     pub fn underrun_count(&self) -> u64 {
-        self.underrun_count.load(Ordering::Relaxed)
+        self.underrun_count.0.load(Ordering::Relaxed)
     }
 
     /// 获取 callback 计数
     #[inline]
     pub fn callback_count(&self) -> u64 {
-        self.callback_count.load(Ordering::Relaxed)
+        self.callback_count.0.load(Ordering::Relaxed)
     }
 
     /// 获取已播放样本数
     #[inline]
     pub fn samples_played(&self) -> u64 {
-        self.samples_played.load(Ordering::Relaxed)
+        self.samples_played.0.load(Ordering::Relaxed)
     }
 
     /// 生成报告
@@ -167,24 +172,24 @@ impl PlaybackStats {
         };
 
         StatsReport {
-            callback_count: self.callback_count.load(Ordering::Relaxed),
+            callback_count: self.callback_count.0.load(Ordering::Relaxed),
             sample_interval: SAMPLE_INTERVAL,
             expected_sampled_interval_ns,
             interval_stats,
             water_stats,
-            underrun_count: self.underrun_count.load(Ordering::Relaxed),
-            samples_played: self.samples_played.load(Ordering::Relaxed),
+            underrun_count: self.underrun_count.0.load(Ordering::Relaxed),
+            samples_played: self.samples_played.0.load(Ordering::Relaxed),
         }
     }
 
     /// 重置统计
     pub fn reset(&self) {
-        self.callback_count.store(0, Ordering::Relaxed);
+        self.callback_count.0.store(0, Ordering::Relaxed);
         self.last_sampled_ticks.store(0, Ordering::Relaxed);
         self.interval_write_idx.store(0, Ordering::Relaxed);
         self.water_level_write_idx.store(0, Ordering::Relaxed);
-        self.underrun_count.store(0, Ordering::Relaxed);
-        self.samples_played.store(0, Ordering::Relaxed);
+        self.underrun_count.0.store(0, Ordering::Relaxed);
+        self.samples_played.0.store(0, Ordering::Relaxed);
 
         for i in 0..TIMESTAMP_BUFFER_SIZE {
             self.interval_buffer[i].store(0, Ordering::Relaxed);

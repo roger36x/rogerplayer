@@ -216,6 +216,7 @@ impl Engine {
         let ring_buffer = Arc::clone(&self.ring_buffer);
         let prebuffer_ratio = self.config.prebuffer_ratio;
         let channels = info.channels as usize;
+        let sample_rate = source_sample_rate;
 
         let decoder_thread = thread::Builder::new()
             .name("decoder".to_string())
@@ -226,6 +227,7 @@ impl Engine {
                     decoder_state,
                     prebuffer_ratio,
                     channels,
+                    sample_rate,
                 );
             })
             .expect("Failed to spawn decoder thread");
@@ -249,6 +251,7 @@ impl Engine {
         state: Arc<DecoderState>,
         prebuffer_ratio: f64,
         channels: usize,
+        sample_rate: u32,
     ) {
         // 设置较高的线程优先级（但不是实时，避免影响 CoreAudio IO 线程）
         Self::set_decoder_thread_priority();
@@ -262,9 +265,16 @@ impl Engine {
         // 读取块大小
         let read_chunk_size = 4096 * channels;
 
+        // 自适应等待参数
+        // 计算消耗速率：每微秒消耗多少样本
+        // samples_per_us = sample_rate * channels / 1_000_000
+        let samples_per_us = (sample_rate as u64 * channels as u64) as f64 / 1_000_000.0;
+        let min_free_threshold = 1024 * channels;
+
         log::info!(
-            "Decoder thread started, prebuffer target: {} samples",
-            prebuffer_samples
+            "Decoder thread started, prebuffer target: {} samples, consumption rate: {:.2} samples/µs",
+            prebuffer_samples,
+            samples_per_us
         );
 
         while state.running.load(Ordering::Acquire) {
@@ -289,16 +299,32 @@ impl Engine {
             // 检查缓冲区是否有空间
             let available_write = ring_buffer.free_space();
 
-            if available_write < 1024 * channels {
-                // 缓冲区快满了 - 使用 spin + yield 策略
-                // 先自旋几次（适合非常短的等待）
-                for _ in 0..32 {
-                    std::hint::spin_loop();
+            if available_write < min_free_threshold {
+                // 缓冲区快满了 - 使用自适应等待策略
+                // 计算需要等待多久才能有足够空间
+                let samples_needed = min_free_threshold - available_write;
+                let wait_us = (samples_needed as f64 / samples_per_us) as u64;
+
+                // 根据等待时间选择策略：
+                // - < 50µs: 仅自旋（避免 syscall 开销）
+                // - 50-500µs: yield + 短自旋
+                // - > 500µs: 睡眠（节省 CPU）
+                if wait_us < 50 {
+                    // 短等待：纯自旋
+                    for _ in 0..64 {
+                        std::hint::spin_loop();
+                    }
+                } else if wait_us < 500 {
+                    // 中等等待：yield 后短自旋
+                    thread::yield_now();
+                    for _ in 0..32 {
+                        std::hint::spin_loop();
+                    }
+                } else {
+                    // 长等待：睡眠 70% 的预计时间（留出余量）
+                    let sleep_us = (wait_us * 7 / 10).max(100).min(2000);
+                    thread::sleep(std::time::Duration::from_micros(sleep_us));
                 }
-                // 然后 yield 让出 CPU
-                thread::yield_now();
-                // 最后短暂睡眠（1ms，比之前的 5ms 减少 80%）
-                thread::sleep(std::time::Duration::from_millis(1));
                 continue;
             }
 
