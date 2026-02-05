@@ -221,7 +221,6 @@ fn draw_now_playing(f: &mut Frame, app: &App, area: Rect) {
         (progress_ratio * 100.0) as u32
     );
     lines.push(Line::from(Span::styled(progress_bar, Style::default().fg(Color::Cyan))));
-    lines.push(Line::from("")); // 空行
 
     // 3. 格式信息
     if let Some(info) = app.engine.current_info() {
@@ -262,6 +261,7 @@ fn draw_now_playing(f: &mut Frame, app: &App, area: Rect) {
         };
         let output_line = format!("Output: {}", output_mode);
         lines.push(Line::from(Span::styled(output_line, Style::default().fg(Color::White))));
+        lines.push(Line::from("")); // 空行
 
         // Bit-Perfect 状态（使用醒目颜色）
         let (bp_text, bp_color) = if bit_perfect {
