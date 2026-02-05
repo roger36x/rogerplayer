@@ -13,7 +13,11 @@
       "Bash(~/.cargo/bin/cargo build:*)",
       "Bash(otool:*)",
       "Bash(~/.cargo/bin/cargo:*)",
-      "Bash(/usr/local/bin/cargo:*)"
+      "Bash(/usr/local/bin/cargo:*)",
+      "Bash(chmod:*)",
+      "Bash(/Users/bytedance/hifi/replayer/scripts/build-app.sh:*)",
+      "Bash(rustup target add:*)",
+      "Bash(./scripts/build-app.sh:*)"
     ]
   }
 }

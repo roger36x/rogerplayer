@@ -248,8 +248,9 @@ fn draw_now_playing(f: &mut Frame, app: &App, area: Rect) {
         );
         lines.push(Line::from(Span::styled(format_line, Style::default().fg(Color::White))));
 
-        // 4. 输出模式
+        // 4. 输出模式 + Bit-Perfect 状态
         let (hal, exclusive) = app.engine.output_mode().unwrap_or((false, false));
+        let bit_perfect = app.engine.is_bit_perfect();
         let output_mode = if hal {
             if exclusive {
                 "HAL (Exclusive)"
@@ -261,14 +262,23 @@ fn draw_now_playing(f: &mut Frame, app: &App, area: Rect) {
         };
         let output_line = format!("Output: {}", output_mode);
         lines.push(Line::from(Span::styled(output_line, Style::default().fg(Color::White))));
+
+        // Bit-Perfect 状态（使用醒目颜色）
+        let (bp_text, bp_color) = if bit_perfect {
+            ("BIT-PERFECT", Color::Green)
+        } else {
+            ("Not Bit-Perfect", Color::Yellow)
+        };
+        lines.push(Line::from(Span::styled(bp_text, Style::default().fg(bp_color).add_modifier(Modifier::BOLD))));
         lines.push(Line::from("")); // 空行
 
         // 5. 系统统计
         lines.push(Line::from(Span::styled("System Stats", Style::default().add_modifier(Modifier::BOLD))));
 
-        // Buffer 条形图
+        // Buffer 条形图（动态宽度适应面板）
         let buffer_ratio = stats.buffer_fill_ratio.min(1.0);
-        let buffer_bar_width: usize = 15;
+        // "Buffer: [" = 9, "] " = 2, "100%" = 4, 共 15 固定字符
+        let buffer_bar_width = (inner_area.width as usize).saturating_sub(15).max(5);
         let buffer_filled = (buffer_bar_width as f64 * buffer_ratio) as usize;
         let buffer_empty = buffer_bar_width.saturating_sub(buffer_filled);
         let buffer_line = format!(

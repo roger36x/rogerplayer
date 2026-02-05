@@ -2220,6 +2220,39 @@ impl AudioOutput {
         self.hog_mode_acquired
     }
 
+    /// 获取输出格式模式
+    pub fn output_format_mode(&self) -> Option<OutputFormatMode> {
+        self.context.as_ref().map(|c| c.output_mode)
+    }
+
+    /// 检查是否为 bit-perfect 输出
+    ///
+    /// Bit-perfect 条件：
+    /// 1. HAL 直接输出
+    /// 2. 独占模式
+    /// 3. 整数格式（Int32 或 Int24）
+    /// 4. 源采样率与设备采样率相同（无 SRC）
+    pub fn is_bit_perfect(&self, source_sample_rate: u32) -> bool {
+        // 必须是 HAL 输出
+        if !self.is_hal_output {
+            return false;
+        }
+
+        // 必须是整数格式
+        let output_mode = match self.output_format_mode() {
+            Some(mode) => mode,
+            None => return false,
+        };
+
+        if !matches!(output_mode, OutputFormatMode::Int32 | OutputFormatMode::Int24) {
+            return false;
+        }
+
+        // 必须是无 SRC（采样率匹配）
+        let device_rate = self.actual_format.sample_rate;
+        source_sample_rate == device_rate
+    }
+
     /// 获取设备 ID
     pub fn device_id(&self) -> u32 {
         self.device_id

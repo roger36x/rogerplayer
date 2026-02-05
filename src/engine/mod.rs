@@ -500,6 +500,25 @@ impl Engine {
     pub fn output_mode(&self) -> Option<(bool, bool)> {
         self.output.as_ref().map(|o| (o.is_hal_output(), o.is_exclusive_mode()))
     }
+
+    /// 检查是否为 bit-perfect 输出
+    ///
+    /// Bit-perfect 意味着：
+    /// - HAL 直接输出（绕过系统混音器）
+    /// - 独占模式
+    /// - 整数格式（无浮点转换）
+    /// - 无采样率转换（SRC）
+    pub fn is_bit_perfect(&self) -> bool {
+        let source_rate = self.current_info
+            .as_ref()
+            .map(|i| i.sample_rate)
+            .unwrap_or(0);
+
+        self.output
+            .as_ref()
+            .map(|o| o.is_bit_perfect(source_rate))
+            .unwrap_or(false)
+    }
 }
 
 impl Drop for Engine {

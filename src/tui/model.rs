@@ -99,9 +99,13 @@ impl App {
 
     /// 从路径加载播放列表
     pub fn load_path(&mut self, path_str: &str) {
-        // 清理路径字符串（去除首尾空白和引号）
+        // 清理路径字符串
+        // 1. 去除首尾空白
+        // 2. 去除首尾引号
+        // 3. 处理 shell 转义字符（macOS Terminal 拖拽文件时会转义空格等）
         let path_str = path_str.trim().trim_matches(|c| c == '\'' || c == '"');
-        let path = PathBuf::from(path_str);
+        let path_str = Self::unescape_shell_path(path_str);
+        let path = PathBuf::from(&path_str);
 
         if !path.exists() {
             self.log(format!("Path not found: {}", path_str));
@@ -144,6 +148,35 @@ impl App {
 
         // 自动播放第一首
         self.play_current();
+    }
+
+    /// 处理 shell 转义的路径
+    /// macOS Terminal 拖拽文件时会转义空格和特殊字符：
+    /// - `\ ` -> ` ` (空格)
+    /// - `\\` -> `\` (反斜杠)
+    /// - `\'` -> `'` (单引号)
+    /// - `\(`, `\)` 等特殊字符
+    fn unescape_shell_path(s: &str) -> String {
+        let mut result = String::with_capacity(s.len());
+        let mut chars = s.chars().peekable();
+
+        while let Some(c) = chars.next() {
+            if c == '\\' {
+                // 反斜杠：检查下一个字符
+                if let Some(&next) = chars.peek() {
+                    // 转义字符，取消转义
+                    result.push(next);
+                    chars.next();
+                } else {
+                    // 末尾的反斜杠，保留
+                    result.push(c);
+                }
+            } else {
+                result.push(c);
+            }
+        }
+
+        result
     }
 
     /// 检查文件是否为支持的音频格式
