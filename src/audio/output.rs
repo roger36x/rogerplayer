@@ -2104,7 +2104,7 @@ impl AudioOutput {
 
         // 创建电源管理断言，防止 CPU 降频
         // 这对于保持音频处理的时序稳定性非常重要
-        self.power_assertion = power_management::PowerAssertion::new("HiFi Replayer Audio Playback");
+        self.power_assertion = power_management::PowerAssertion::new("Roger Player Audio Playback");
 
         log::info!(
             "Audio output started: {}Hz (device), {} channels, {}bit, {:?}, mode={:?}",

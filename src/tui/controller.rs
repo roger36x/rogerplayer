@@ -27,7 +27,7 @@ pub fn run(mut app: App) -> io::Result<()> {
     if !app.playlist.is_empty() {
         app.play_current();
     } else {
-        app.log("No audio files found in directory.".to_string());
+        app.log("Drop a file or folder to start playing".to_string());
     }
 
     loop {
@@ -42,54 +42,94 @@ pub fn run(mut app: App) -> io::Result<()> {
         if crossterm::event::poll(timeout)? {
             if let Event::Key(key) = event::read()? {
                 if key.kind == KeyEventKind::Press {
-                    match key.code {
-                        KeyCode::Char('q') | KeyCode::Esc => {
-                            app.should_quit = true;
-                        }
-                        KeyCode::Char(' ') => {
-                            if let Err(e) = app.engine.toggle_pause() {
-                                app.log(format!("Error: {}", e));
+                    // 输入模式下的按键处理
+                    if app.input_mode {
+                        match key.code {
+                            KeyCode::Enter => {
+                                if !app.path_input.is_empty() {
+                                    let path = app.path_input.clone();
+                                    app.load_path(&path);
+                                }
                             }
+                            KeyCode::Esc => {
+                                if app.playlist.is_empty() {
+                                    // 没有播放列表时，Esc 退出程序
+                                    app.should_quit = true;
+                                } else {
+                                    // 有播放列表时，取消输入模式
+                                    app.input_mode = false;
+                                    app.path_input.clear();
+                                }
+                            }
+                            KeyCode::Char('q') if app.path_input.is_empty() => {
+                                app.should_quit = true;
+                            }
+                            KeyCode::Backspace => {
+                                app.path_input.pop();
+                            }
+                            KeyCode::Char(c) => {
+                                app.path_input.push(c);
+                            }
+                            _ => {}
                         }
-                        KeyCode::Char('n') => app.next_track(),
-                        KeyCode::Char('p') => app.prev_track(),
-                        KeyCode::Down | KeyCode::Char('j') => {
-                            if !app.playlist.is_empty() {
-                                let i = match app.playlist_state.selected() {
-                                    Some(i) => {
-                                        if i >= app.playlist.len() - 1 {
-                                            0
-                                        } else {
-                                            i + 1
+                    } else {
+                        // 正常模式下的按键处理
+                        match key.code {
+                            KeyCode::Char('q') | KeyCode::Esc => {
+                                app.should_quit = true;
+                            }
+                            KeyCode::Char(' ') => {
+                                if let Err(e) = app.engine.toggle_pause() {
+                                    app.log(format!("Error: {}", e));
+                                }
+                            }
+                            KeyCode::Char('n') => app.next_track(),
+                            KeyCode::Char('p') => app.prev_track(),
+                            KeyCode::Char('o') => {
+                                // 进入输入模式
+                                app.input_mode = true;
+                                app.path_input.clear();
+                            }
+                            KeyCode::Char('s') => app.toggle_shuffle(),
+                            KeyCode::Char('r') => app.cycle_repeat(),
+                            KeyCode::Down | KeyCode::Char('j') => {
+                                if !app.playlist.is_empty() {
+                                    let i = match app.playlist_state.selected() {
+                                        Some(i) => {
+                                            if i >= app.playlist.len() - 1 {
+                                                0
+                                            } else {
+                                                i + 1
+                                            }
                                         }
-                                    }
-                                    None => 0,
-                                };
-                                app.playlist_state.select(Some(i));
+                                        None => 0,
+                                    };
+                                    app.playlist_state.select(Some(i));
+                                }
                             }
-                        }
-                        KeyCode::Up | KeyCode::Char('k') => {
-                            if !app.playlist.is_empty() {
-                                let i = match app.playlist_state.selected() {
-                                    Some(i) => {
-                                        if i == 0 {
-                                            app.playlist.len() - 1
-                                        } else {
-                                            i - 1
+                            KeyCode::Up | KeyCode::Char('k') => {
+                                if !app.playlist.is_empty() {
+                                    let i = match app.playlist_state.selected() {
+                                        Some(i) => {
+                                            if i == 0 {
+                                                app.playlist.len() - 1
+                                            } else {
+                                                i - 1
+                                            }
                                         }
-                                    }
-                                    None => 0,
-                                };
-                                app.playlist_state.select(Some(i));
+                                        None => 0,
+                                    };
+                                    app.playlist_state.select(Some(i));
+                                }
                             }
-                        }
-                        KeyCode::Enter => {
-                            if let Some(i) = app.playlist_state.selected() {
-                                app.current_index = i;
-                                app.play_current();
+                            KeyCode::Enter => {
+                                if let Some(i) = app.playlist_state.selected() {
+                                    app.current_index = i;
+                                    app.play_current();
+                                }
                             }
+                            _ => {}
                         }
-                        _ => {}
                     }
                 }
             }

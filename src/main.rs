@@ -1,4 +1,4 @@
-//! HiFi Replayer - 极致音质音频播放器
+//! Roger Player - 极致音质音频播放器
 //!
 //! 设计目标：
 //! - 时序绝对稳定：lock-free 架构 + 实时线程
@@ -114,7 +114,7 @@ fn read_key_nonblocking() -> Option<KeyPress> {
     }
 }
 
-/// HiFi Replayer - High-fidelity audio player
+/// Roger Player - High-fidelity audio player
 #[derive(Parser)]
 #[command(name = "roger-player")]
 #[command(author, version, about, long_about = None)]
@@ -204,12 +204,15 @@ fn main() -> anyhow::Result<()> {
             simple_play(file, &cli)?;
         }
         Some(Commands::Tui { ref file }) => {
+            // TUI 模式下禁用日志输出到 stderr，避免干扰界面
+            log::set_max_level(log::LevelFilter::Off);
+
             let path = file.as_ref().or(cli.file.as_ref());
             if let Some(p) = path {
                 tui_play(p, &cli)?;
             } else {
-                println!("Please specify a file or directory for TUI mode.");
-                println!("Usage: roger-player tui <FILE|DIR>");
+                // 无参数启动，显示空界面等待拖拽
+                tui_play_empty(&cli)?;
             }
         }
         None => {
@@ -217,7 +220,7 @@ fn main() -> anyhow::Result<()> {
                 simple_play(file, &cli)?;
             } else {
                 // 没有参数，显示帮助
-                println!("HiFi Replayer - Extreme quality audio player\n");
+                println!("Roger Player - Extreme quality audio player\n");
                 println!("Usage: roger-player [OPTIONS] <FILE|DIR>");
                 println!("       roger-player info");
                 println!("       roger-player tui <FILE|DIR>");
@@ -316,7 +319,7 @@ fn play_single_file_repeat(file: &PathBuf, cli: &Cli) -> anyhow::Result<()> {
         r.store(false, Ordering::SeqCst);
     })?;
 
-    println!("HiFi Replayer - Single Track Repeat Mode");
+    println!("Roger Player - Single Track Repeat Mode");
     println!("Press Ctrl+C to stop.\n");
 
     let mut play_count = 0u64;
@@ -375,7 +378,7 @@ fn play_directory(dir: &PathBuf, cli: &Cli) -> anyhow::Result<()> {
         format!(" [{}]", mode_flags.join(", "))
     };
 
-    println!("HiFi Replayer - Directory Mode{}", mode_str);
+    println!("Roger Player - Directory Mode{}", mode_str);
     println!("Found {} audio files in: {}\n", files.len(), dir.display());
 
     for (i, file) in files.iter().enumerate() {
@@ -510,7 +513,7 @@ fn play_single_file_with_running(
             println!("[{}/{}] Loading: {}", current, total, file_name);
         }
     } else {
-        println!("HiFi Replayer - Loading: {}", file.display());
+        println!("Roger Player - Loading: {}", file.display());
     }
 
     engine.play(file)?;
@@ -619,7 +622,7 @@ fn interactive_play(file: &PathBuf, cli: &Cli) -> anyhow::Result<()> {
     let config = create_engine_config(cli);
     let mut engine = Engine::new(config);
 
-    println!("HiFi Replayer - Interactive Mode");
+    println!("Roger Player - Interactive Mode");
     println!("Loading: {}", file.display());
 
     engine.play(file)?;
@@ -693,9 +696,19 @@ fn tui_play(path: &PathBuf, cli: &Cli) -> anyhow::Result<()> {
 
     let config = create_engine_config(cli);
     let app = crate::tui::model::App::new(config, files);
-    
+
     crate::tui::controller::run(app)?;
-    
+
+    Ok(())
+}
+
+/// TUI 空启动模式（无参数，等待拖拽文件）
+fn tui_play_empty(cli: &Cli) -> anyhow::Result<()> {
+    let config = create_engine_config(cli);
+    let app = crate::tui::model::App::new_empty(config);
+
+    crate::tui::controller::run(app)?;
+
     Ok(())
 }
 

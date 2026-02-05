@@ -1,4 +1,4 @@
-//! HiFi Replayer Library
+//! Roger Player Library
 //!
 //! Audio playback engine for high-fidelity audio playback.
 

@@ -6,7 +6,7 @@ use ratatui::{
     Frame,
 };
 
-use super::model::App;
+use super::model::{App, RepeatMode};
 use crate::engine::PlaybackState;
 
 pub fn draw(f: &mut Frame, app: &mut App) {
@@ -35,10 +35,27 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
         PlaybackState::Buffering => "[BUFFERING]",
     };
 
-    // 单行显示：HiFi Replayer v0.1.0                     [RUNNING]
-    let title = format!("HiFi Replayer v0.1.0");
-    let spaces = " ".repeat(area.width.saturating_sub(title.len() as u16 + state_str.len() as u16 + 2) as usize);
-    let header_line = format!("{}{}{}", title, spaces, state_str);
+    // 构建模式标签
+    let mut mode_tags = Vec::new();
+    if app.shuffle {
+        mode_tags.push("[SHUFFLE]");
+    }
+    match app.repeat_mode {
+        RepeatMode::All => mode_tags.push("[REPEAT:ALL]"),
+        RepeatMode::Track => mode_tags.push("[REPEAT:1]"),
+        RepeatMode::Off => {}
+    }
+    let modes_str = mode_tags.join(" ");
+
+    // 单行显示：Roger Player v0.1.0    [SHUFFLE] [REPEAT:ALL]    [RUNNING]
+    let title = "Roger Player v0.1.0";
+    let right_part = if modes_str.is_empty() {
+        state_str.to_string()
+    } else {
+        format!("{} {}", modes_str, state_str)
+    };
+    let spaces = " ".repeat(area.width.saturating_sub(title.len() as u16 + right_part.len() as u16 + 2) as usize);
+    let header_line = format!("{}{}{}", title, spaces, right_part);
 
     let block = Block::default().borders(Borders::ALL);
     let paragraph = Paragraph::new(header_line).block(block);
@@ -50,8 +67,8 @@ fn draw_main(f: &mut Frame, app: &mut App, area: Rect) {
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Percentage(50),
-            Constraint::Percentage(50),
+            Constraint::Percentage(65),
+            Constraint::Percentage(35),
         ])
         .split(area);
 
@@ -60,6 +77,12 @@ fn draw_main(f: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn draw_playlist(f: &mut Frame, app: &mut App, area: Rect) {
+    // 如果在输入模式，显示路径输入界面
+    if app.input_mode {
+        draw_path_input(f, app, area);
+        return;
+    }
+
     let items: Vec<ListItem> = app
         .playlist
         .iter()
@@ -82,13 +105,71 @@ fn draw_playlist(f: &mut Frame, app: &mut App, area: Rect) {
         .collect();
 
     let playlist = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title("♫ Playlist"));
+        .block(Block::default().borders(Borders::ALL).title("Playlist"));
 
     f.render_stateful_widget(playlist, area, &mut app.playlist_state);
 }
 
+fn draw_path_input(f: &mut Frame, app: &App, area: Rect) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("Drop Path Here");
+
+    let inner_area = Rect {
+        x: area.x + 1,
+        y: area.y + 1,
+        width: area.width.saturating_sub(2),
+        height: area.height.saturating_sub(2),
+    };
+
+    f.render_widget(block, area);
+
+    let mut lines = Vec::new();
+
+    // 说明文字
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Drag and drop a file or folder here",
+        Style::default().fg(Color::DarkGray),
+    )));
+    lines.push(Line::from(Span::styled(
+        "or type/paste the path manually:",
+        Style::default().fg(Color::DarkGray),
+    )));
+    lines.push(Line::from(""));
+
+    // 输入框
+    let input_display = if app.path_input.is_empty() {
+        Span::styled("_", Style::default().fg(Color::Cyan).add_modifier(Modifier::SLOW_BLINK))
+    } else {
+        // 显示输入内容 + 光标
+        let display = format!("{}_", app.path_input);
+        Span::styled(display, Style::default().fg(Color::Cyan))
+    };
+    lines.push(Line::from(vec![
+        Span::raw("> "),
+        input_display,
+    ]));
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Press Enter to load, Esc to cancel",
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    // 支持的格式
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Supported: flac, wav, aiff, mp3, pcm",
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    let paragraph = Paragraph::new(lines);
+    f.render_widget(paragraph, inner_area);
+}
+
 fn draw_now_playing(f: &mut Frame, app: &App, area: Rect) {
-    let outer_block = Block::default().borders(Borders::ALL).title("🎵 Now Playing");
+    let outer_block = Block::default().borders(Borders::ALL).title("Now Playing");
     f.render_widget(outer_block, area);
 
     // 计算内部区域（减去边框）
@@ -165,7 +246,7 @@ fn draw_now_playing(f: &mut Frame, app: &App, area: Rect) {
             info.sample_rate / 1000,
             bit_depth_str
         );
-        lines.push(Line::from(Span::styled(format_line, Style::default().fg(Color::Yellow))));
+        lines.push(Line::from(Span::styled(format_line, Style::default().fg(Color::White))));
 
         // 4. 输出模式
         let (hal, exclusive) = app.engine.output_mode().unwrap_or((false, false));
@@ -179,31 +260,24 @@ fn draw_now_playing(f: &mut Frame, app: &App, area: Rect) {
             "System Mixer"
         };
         let output_line = format!("Output: {}", output_mode);
-        lines.push(Line::from(Span::styled(output_line, Style::default().fg(Color::Magenta))));
+        lines.push(Line::from(Span::styled(output_line, Style::default().fg(Color::White))));
         lines.push(Line::from("")); // 空行
 
         // 5. 系统统计
-        lines.push(Line::from(Span::styled("📊 System Stats", Style::default().add_modifier(Modifier::BOLD))));
+        lines.push(Line::from(Span::styled("System Stats", Style::default().add_modifier(Modifier::BOLD))));
 
         // Buffer 条形图
         let buffer_ratio = stats.buffer_fill_ratio.min(1.0);
         let buffer_bar_width: usize = 15;
         let buffer_filled = (buffer_bar_width as f64 * buffer_ratio) as usize;
         let buffer_empty = buffer_bar_width.saturating_sub(buffer_filled);
-        let buffer_color = if buffer_ratio < 0.2 {
-            Color::Red
-        } else if buffer_ratio < 0.5 {
-            Color::Yellow
-        } else {
-            Color::Green
-        };
         let buffer_line = format!(
             "Buffer: [{}{}] {:>3}%",
             "|".repeat(buffer_filled),
             " ".repeat(buffer_empty),
             (buffer_ratio * 100.0) as u32
         );
-        lines.push(Line::from(Span::styled(buffer_line, Style::default().fg(buffer_color))));
+        lines.push(Line::from(Span::styled(buffer_line, Style::default().fg(Color::White))));
 
         // Underruns
         let underrun_color = if stats.underrun_count > 0 {
@@ -236,8 +310,12 @@ fn draw_logs(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(paragraph, area);
 }
 
-fn draw_footer(f: &mut Frame, _app: &App, area: Rect) {
-    let info = "SPACE: Pause | n: Next | p: Prev | q: Quit | Enter: Play";
+fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
+    let info = if app.input_mode {
+        "Enter: Load | Esc: Cancel | q: Quit"
+    } else {
+        "SPACE: Pause | n/p: Next/Prev | s: Shuffle | r: Repeat | o: Open | q: Quit"
+    };
     let block = Block::default().borders(Borders::ALL);
     let paragraph = Paragraph::new(info)
         .block(block)
