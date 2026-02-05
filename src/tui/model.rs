@@ -85,6 +85,27 @@ pub struct App {
 
     /// 弹窗状态
     pub dialog: DialogState,
+
+    /// 上次选曲操作时间（用于自动回位）
+    pub last_selection_time: Option<Instant>,
+
+    /// 是否显示选曲光标
+    pub show_cursor: bool,
+
+    /// 是否处于搜索模式
+    pub search_mode: bool,
+
+    /// 搜索输入
+    pub search_input: String,
+
+    /// 搜索结果索引列表
+    pub search_results: Vec<usize>,
+
+    /// 当前搜索结果中的选中索引
+    pub search_result_index: usize,
+
+    /// 是否显示帮助页面
+    pub show_help: bool,
 }
 
 /// 切歌防抖间隔（毫秒）
@@ -122,6 +143,13 @@ impl App {
             shuffle_order,
             last_switch_time: None,
             dialog: DialogState::None,
+            last_selection_time: None,
+            show_cursor: false,
+            search_mode: false,
+            search_input: String::new(),
+            search_results: Vec::new(),
+            search_result_index: 0,
+            show_help: false,
         }
     }
 
@@ -516,5 +544,76 @@ impl App {
             self.log("Track finished".to_string());
             self.go_to_next(true); // 自动切歌
         }
+
+        // 10秒无选曲操作，自动回位到当前播放曲目并隐藏光标
+        if let Some(last_time) = self.last_selection_time {
+            if last_time.elapsed() > Duration::from_secs(10) {
+                self.playlist_state.select(Some(self.current_index));
+                self.last_selection_time = None;
+                self.show_cursor = false;
+            }
+        }
+    }
+
+    /// 执行搜索
+    pub fn do_search(&mut self) {
+        let query = self.search_input.to_lowercase();
+        self.search_results = self
+            .playlist
+            .iter()
+            .enumerate()
+            .filter(|(_, path)| {
+                path.file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_lowercase()
+                    .contains(&query)
+            })
+            .map(|(i, _)| i)
+            .collect();
+        self.search_result_index = 0;
+
+        // 如果有结果，跳转到第一个
+        if let Some(&idx) = self.search_results.first() {
+            self.playlist_state.select(Some(idx));
+            self.show_cursor = true;
+            self.last_selection_time = Some(Instant::now());
+        }
+    }
+
+    /// 跳转到下一个搜索结果
+    pub fn search_next(&mut self) {
+        if self.search_results.is_empty() {
+            return;
+        }
+        self.search_result_index = (self.search_result_index + 1) % self.search_results.len();
+        let idx = self.search_results[self.search_result_index];
+        self.playlist_state.select(Some(idx));
+        self.show_cursor = true;
+        self.last_selection_time = Some(Instant::now());
+    }
+
+    /// 跳转到上一个搜索结果
+    pub fn search_prev(&mut self) {
+        if self.search_results.is_empty() {
+            return;
+        }
+        if self.search_result_index == 0 {
+            self.search_result_index = self.search_results.len() - 1;
+        } else {
+            self.search_result_index -= 1;
+        }
+        let idx = self.search_results[self.search_result_index];
+        self.playlist_state.select(Some(idx));
+        self.show_cursor = true;
+        self.last_selection_time = Some(Instant::now());
+    }
+
+    /// 退出搜索模式
+    pub fn exit_search(&mut self) {
+        self.search_mode = false;
+        self.search_input.clear();
+        self.search_results.clear();
+        self.search_result_index = 0;
     }
 }

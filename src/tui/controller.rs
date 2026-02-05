@@ -71,6 +71,41 @@ pub fn run(mut app: App) -> io::Result<()> {
                             _ => {}
                         }
                     }
+                    // 帮助页面：任意键关闭
+                    else if app.show_help {
+                        app.show_help = false;
+                    }
+                    // 搜索模式下的按键处理
+                    else if app.search_mode {
+                        match key.code {
+                            KeyCode::Enter => {
+                                // 确认选择并退出搜索
+                                if let Some(i) = app.playlist_state.selected() {
+                                    app.current_index = i;
+                                    app.play_current();
+                                }
+                                app.exit_search();
+                            }
+                            KeyCode::Esc => {
+                                app.exit_search();
+                            }
+                            KeyCode::Down => {
+                                app.search_next();
+                            }
+                            KeyCode::Up => {
+                                app.search_prev();
+                            }
+                            KeyCode::Backspace => {
+                                app.search_input.pop();
+                                app.do_search();
+                            }
+                            KeyCode::Char(c) => {
+                                app.search_input.push(c);
+                                app.do_search();
+                            }
+                            _ => {}
+                        }
+                    }
                     // 输入模式下的按键处理
                     else if app.input_mode {
                         match key.code {
@@ -123,32 +158,24 @@ pub fn run(mut app: App) -> io::Result<()> {
                             KeyCode::Char('r') => app.cycle_repeat(),
                             KeyCode::Down | KeyCode::Char('j') => {
                                 if !app.playlist.is_empty() {
-                                    let i = match app.playlist_state.selected() {
-                                        Some(i) => {
-                                            if i >= app.playlist.len() - 1 {
-                                                0
-                                            } else {
-                                                i + 1
-                                            }
-                                        }
-                                        None => 0,
-                                    };
-                                    app.playlist_state.select(Some(i));
+                                    app.last_selection_time = Some(Instant::now());
+                                    app.show_cursor = true;
+
+                                    let len = app.playlist.len();
+                                    let current = app.playlist_state.selected().unwrap_or(0);
+                                    let new_index = (current + 1) % len;
+                                    app.playlist_state.select(Some(new_index));
                                 }
                             }
                             KeyCode::Up | KeyCode::Char('k') => {
                                 if !app.playlist.is_empty() {
-                                    let i = match app.playlist_state.selected() {
-                                        Some(i) => {
-                                            if i == 0 {
-                                                app.playlist.len() - 1
-                                            } else {
-                                                i - 1
-                                            }
-                                        }
-                                        None => 0,
-                                    };
-                                    app.playlist_state.select(Some(i));
+                                    app.last_selection_time = Some(Instant::now());
+                                    app.show_cursor = true;
+
+                                    let len = app.playlist.len();
+                                    let current = app.playlist_state.selected().unwrap_or(0);
+                                    let new_index = if current > 0 { current - 1 } else { len - 1 };
+                                    app.playlist_state.select(Some(new_index));
                                 }
                             }
                             KeyCode::Enter => {
@@ -156,6 +183,13 @@ pub fn run(mut app: App) -> io::Result<()> {
                                     app.current_index = i;
                                     app.play_current();
                                 }
+                            }
+                            KeyCode::Char('/') => {
+                                app.search_mode = true;
+                                app.search_input.clear();
+                            }
+                            KeyCode::Char('h') => {
+                                app.show_help = true;
                             }
                             _ => {}
                         }

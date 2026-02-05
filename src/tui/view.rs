@@ -30,6 +30,11 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     if !matches!(app.dialog, DialogState::None) {
         draw_dialog(f, app);
     }
+
+    // 帮助页面
+    if app.show_help {
+        draw_help(f);
+    }
 }
 
 fn draw_header(f: &mut Frame, app: &App, area: Rect) {
@@ -52,15 +57,24 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
     }
     let modes_str = mode_tags.join(" ");
 
-    // 单行显示：Roger Player v0.1.0    [SHUFFLE] [REPEAT:ALL]    [RUNNING]
+    // 单行显示：Roger Player v0.1.0  (h: Help)    [SHUFFLE] [REPEAT:ALL]    [RUNNING]
     let title = "Roger Player v0.1.0";
+    let help_hint = "(h: Help)";
     let right_part = if modes_str.is_empty() {
         state_str.to_string()
     } else {
         format!("{} {}", modes_str, state_str)
     };
-    let spaces = " ".repeat(area.width.saturating_sub(title.len() as u16 + right_part.len() as u16 + 2) as usize);
-    let header_line = format!("{}{}{}", title, spaces, right_part);
+    let left_part = format!("{}  {}", title, help_hint);
+    let spaces = " ".repeat(area.width.saturating_sub(left_part.len() as u16 + right_part.len() as u16 + 2) as usize);
+
+    let header_line = Line::from(vec![
+        Span::raw(title),
+        Span::raw("  "),
+        Span::styled(help_hint, Style::default().fg(Color::DarkGray)),
+        Span::raw(spaces),
+        Span::raw(right_part),
+    ]);
 
     let block = Block::default().borders(Borders::ALL);
     let paragraph = Paragraph::new(header_line).block(block);
@@ -109,8 +123,21 @@ fn draw_playlist(f: &mut Frame, app: &mut App, area: Rect) {
         })
         .collect();
 
-    let playlist = List::new(items)
+    let mut playlist = List::new(items)
         .block(Block::default().borders(Borders::ALL).title("Playlist"));
+
+    // 只有在 show_cursor 为 true 时才显示选中高亮
+    if app.show_cursor {
+        // 光标背景色使用 Cyan（与正在播放字体颜色一致）
+        // 当光标在正在播放曲目时，字体变白色
+        let cursor_on_current = app.playlist_state.selected() == Some(app.current_index);
+        let highlight_style = if cursor_on_current {
+            Style::default().bg(Color::Cyan).fg(Color::White).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().bg(Color::Cyan)
+        };
+        playlist = playlist.highlight_style(highlight_style);
+    }
 
     f.render_stateful_widget(playlist, area, &mut app.playlist_state);
 }
@@ -326,6 +353,31 @@ fn draw_logs(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
+    // 搜索模式：显示搜索框
+    if app.search_mode {
+        let result_info = if app.search_results.is_empty() {
+            if app.search_input.is_empty() {
+                String::new()
+            } else {
+                " (no match)".to_string()
+            }
+        } else {
+            format!(" ({}/{})", app.search_result_index + 1, app.search_results.len())
+        };
+
+        let search_line = Line::from(vec![
+            Span::styled("/", Style::default().fg(Color::Cyan)),
+            Span::styled(&app.search_input, Style::default().fg(Color::White)),
+            Span::styled("_", Style::default().fg(Color::Cyan).add_modifier(Modifier::SLOW_BLINK)),
+            Span::styled(result_info, Style::default().fg(Color::DarkGray)),
+        ]);
+
+        let block = Block::default().borders(Borders::ALL).title("Search");
+        let paragraph = Paragraph::new(search_line).block(block);
+        f.render_widget(paragraph, area);
+        return;
+    }
+
     let info = if !matches!(app.dialog, DialogState::None) {
         "↑/↓: Select | Enter: Confirm | Esc: Cancel"
     } else if app.input_mode {
@@ -421,4 +473,76 @@ fn draw_dialog(f: &mut Frame, app: &App) {
         let paragraph = Paragraph::new(lines);
         f.render_widget(paragraph, inner);
     }
+}
+
+/// 渲染帮助页面
+fn draw_help(f: &mut Frame) {
+    let area = f.size();
+
+    // 弹窗尺寸
+    let dialog_width = 45u16.min(area.width.saturating_sub(4));
+    let dialog_height = 18u16.min(area.height.saturating_sub(4));
+
+    // 居中计算
+    let x = (area.width.saturating_sub(dialog_width)) / 2;
+    let y = (area.height.saturating_sub(dialog_height)) / 2;
+
+    let dialog_area = Rect::new(x, y, dialog_width, dialog_height);
+
+    // 清除弹窗区域的背景内容
+    f.render_widget(Clear, dialog_area);
+
+    // 弹窗边框
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .style(Style::default().bg(Color::Black))
+        .title(" Help ");
+
+    f.render_widget(block, dialog_area);
+
+    // 内部区域
+    let inner = Rect {
+        x: dialog_area.x + 2,
+        y: dialog_area.y + 1,
+        width: dialog_area.width.saturating_sub(4),
+        height: dialog_area.height.saturating_sub(2),
+    };
+
+    let help_items = vec![
+        ("SPACE", "Pause / Resume"),
+        ("n / p", "Next / Previous track"),
+        ("↑ / ↓", "Navigate playlist"),
+        ("Enter", "Play selected track"),
+        ("/", "Search songs"),
+        ("s", "Toggle shuffle"),
+        ("r", "Cycle repeat mode"),
+        ("o", "Open file / folder"),
+        ("h", "Show this help"),
+        ("q / Esc", "Quit"),
+        ("", ""),
+        ("In Search Mode:", ""),
+        ("↑ / ↓", "Navigate results"),
+        ("Enter", "Play & close search"),
+        ("Esc", "Cancel search"),
+    ];
+
+    let lines: Vec<Line> = help_items
+        .iter()
+        .map(|(key, desc)| {
+            if key.is_empty() {
+                Line::from("")
+            } else if desc.is_empty() {
+                Line::from(Span::styled(*key, Style::default().fg(Color::Yellow)))
+            } else {
+                Line::from(vec![
+                    Span::styled(format!("{:<12}", key), Style::default().fg(Color::Cyan)),
+                    Span::styled(*desc, Style::default().fg(Color::White)),
+                ])
+            }
+        })
+        .collect();
+
+    let paragraph = Paragraph::new(lines);
+    f.render_widget(paragraph, inner);
 }
