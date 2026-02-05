@@ -140,6 +140,8 @@ impl<T: Copy + Default> RingBuffer<T> {
     ///
     /// 返回实际写入的样本数
     /// 此函数是 wait-free 的，绝不阻塞
+    ///
+    /// 优化：使用批量拷贝代替逐元素循环，利用 SIMD memcpy
     #[inline]
     pub fn write(&self, data: &[T]) -> usize {
         let write = self.write_pos.0.load(Ordering::Relaxed);
@@ -151,10 +153,27 @@ impl<T: Copy + Default> RingBuffer<T> {
         let free = self.capacity - used;
         let to_write = data.len().min(free);
 
-        for i in 0..to_write {
-            let idx = (write + i) & self.mask;
+        if to_write == 0 {
+            return 0;
+        }
+
+        // 计算物理写入位置
+        let write_idx = write & self.mask;
+        // 到缓冲区末尾的连续空间
+        let first_part = (self.capacity - write_idx).min(to_write);
+
+        // 批量拷贝第一段（到缓冲区末尾）
+        unsafe {
+            let dst = self.buffer[write_idx].get() as *mut T;
+            std::ptr::copy_nonoverlapping(data.as_ptr(), dst, first_part);
+        }
+
+        // 如果需要环绕，拷贝第二段（从缓冲区开头）
+        let second_part = to_write - first_part;
+        if second_part > 0 {
             unsafe {
-                *self.buffer[idx].get() = data[i];
+                let dst = self.buffer[0].get() as *mut T;
+                std::ptr::copy_nonoverlapping(data.as_ptr().add(first_part), dst, second_part);
             }
         }
 
@@ -166,6 +185,8 @@ impl<T: Copy + Default> RingBuffer<T> {
     ///
     /// 返回实际读取的样本数
     /// 此函数是 wait-free 的，绝不阻塞
+    ///
+    /// 优化：使用批量拷贝代替逐元素循环，利用 SIMD memcpy
     #[inline]
     pub fn read(&self, output: &mut [T]) -> usize {
         let read = self.read_pos.0.load(Ordering::Relaxed);
@@ -174,9 +195,28 @@ impl<T: Copy + Default> RingBuffer<T> {
         let available = write.wrapping_sub(read);
         let to_read = output.len().min(available);
 
-        for i in 0..to_read {
-            let idx = (read + i) & self.mask;
-            output[i] = unsafe { *self.buffer[idx].get() };
+        if to_read == 0 {
+            return 0;
+        }
+
+        // 计算物理读取位置
+        let read_idx = read & self.mask;
+        // 到缓冲区末尾的连续数据
+        let first_part = (self.capacity - read_idx).min(to_read);
+
+        // 批量拷贝第一段（到缓冲区末尾）
+        unsafe {
+            let src = self.buffer[read_idx].get() as *const T;
+            std::ptr::copy_nonoverlapping(src, output.as_mut_ptr(), first_part);
+        }
+
+        // 如果需要环绕，拷贝第二段（从缓冲区开头）
+        let second_part = to_read - first_part;
+        if second_part > 0 {
+            unsafe {
+                let src = self.buffer[0].get() as *const T;
+                std::ptr::copy_nonoverlapping(src, output.as_mut_ptr().add(first_part), second_part);
+            }
         }
 
         self.read_pos.0.store(read.wrapping_add(to_read), Ordering::Release);

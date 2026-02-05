@@ -448,18 +448,34 @@ impl std::fmt::Display for OutputError {
 
 impl std::error::Error for OutputError {}
 
+/// TPDF Dither 批量缓冲区大小
+/// 选择 64 以匹配常见的 SIMD 向量批处理大小
+const DITHER_BATCH_SIZE: usize = 64;
+
 /// TPDF Dither 状态
 ///
 /// 使用 xorshift32 PRNG，realtime-safe（无分配、无锁）
 /// TPDF = 两个均匀随机数相加，产生三角形概率分布
+///
+/// 支持批量生成以优化 SIMD 流水线
 pub struct DitherState {
     /// xorshift32 状态
     state: u32,
+    /// 预生成的 dither 值缓冲区
+    batch_buffer: [f32; DITHER_BATCH_SIZE],
+    /// 当前批次中的读取位置
+    batch_idx: usize,
 }
 
 impl DitherState {
     pub fn new(seed: u32) -> Self {
-        Self { state: if seed == 0 { 0xDEADBEEF } else { seed } }
+        let mut s = Self {
+            state: if seed == 0 { 0xDEADBEEF } else { seed },
+            batch_buffer: [0.0; DITHER_BATCH_SIZE],
+            batch_idx: DITHER_BATCH_SIZE, // 初始化为满，触发首次填充
+        };
+        s.refill_batch();
+        s
     }
 
     /// 生成下一个随机 u32（xorshift32 算法）
@@ -473,17 +489,65 @@ impl DitherState {
         x
     }
 
+    /// 批量填充 dither 缓冲区
+    ///
+    /// 连续生成 DITHER_BATCH_SIZE 个 TPDF 值
+    /// 这样可以让 CPU 更好地预测分支和预取数据
+    #[inline(always)]
+    fn refill_batch(&mut self) {
+        const SCALE: f32 = 1.0 / 16777216.0; // 2^-24
+
+        for i in 0..DITHER_BATCH_SIZE {
+            // 生成两个随机数用于 TPDF
+            let x1 = {
+                let mut x = self.state;
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                self.state = x;
+                x
+            };
+            let x2 = {
+                let mut x = self.state;
+                x ^= x << 13;
+                x ^= x >> 17;
+                x ^= x << 5;
+                self.state = x;
+                x
+            };
+
+            let r1 = (x1 >> 8) as f32 * SCALE;
+            let r2 = (x2 >> 8) as f32 * SCALE;
+            self.batch_buffer[i] = r1 + r2 - 1.0;
+        }
+        self.batch_idx = 0;
+    }
+
     /// 生成 TPDF dither 值，范围约 [-1, 1]
     ///
     /// TPDF = rand1 + rand2 - 1.0，其中 rand1, rand2 ∈ [0, 1]
     /// 结果是三角形分布，峰值在 0
+    ///
+    /// 使用预生成的批量缓冲区，减少分支预测失败
     #[inline(always)]
     pub fn next_tpdf(&mut self) -> f32 {
-        // 生成两个 [0, 1) 范围的随机数
-        let r1 = (self.next_u32() >> 8) as f32 / 16777216.0; // 24-bit precision
-        let r2 = (self.next_u32() >> 8) as f32 / 16777216.0;
-        // TPDF: 范围 [-1, 1]，三角形分布
-        r1 + r2 - 1.0
+        if self.batch_idx >= DITHER_BATCH_SIZE {
+            self.refill_batch();
+        }
+        let val = self.batch_buffer[self.batch_idx];
+        self.batch_idx += 1;
+        val
+    }
+
+    /// 批量获取 dither 值到输出缓冲区
+    ///
+    /// 这是 SIMD 优化的关键：预生成所有 dither 值，
+    /// 然后在纯 SIMD 循环中使用，避免流水线中断
+    #[inline(always)]
+    pub fn fill_tpdf_batch(&mut self, output: &mut [f32]) {
+        for val in output.iter_mut() {
+            *val = self.next_tpdf();
+        }
     }
 }
 
@@ -510,6 +574,10 @@ pub struct CallbackContext {
 
     /// 预分配的样本缓冲区（i32，保证对齐）
     pub sample_buffer: Vec<i32>,
+
+    /// 预分配的 dither 缓冲区（f32，用于 SIMD 批量处理）
+    /// 大小与 sample_buffer 相同，避免 callback 中分配
+    pub dither_buffer: Vec<f32>,
 
     /// TPDF dither 状态
     pub dither: DitherState,
@@ -645,24 +713,41 @@ impl CallbackContext {
     /// 锁定上下文内存，防止 page fault
     ///
     /// 在实时音频回调中，page fault 会导致严重的时序问题。
-    /// 此函数锁定 CallbackContext 结构体和 sample_buffer 的内存。
+    /// 此函数锁定 CallbackContext 结构体、sample_buffer 和 dither_buffer 的内存。
     pub fn lock_memory(&self) -> bool {
+        let mut success = true;
+
         // 锁定 sample_buffer
         let sample_ptr = self.sample_buffer.as_ptr() as *const libc::c_void;
         let sample_len = self.sample_buffer.len() * std::mem::size_of::<i32>();
 
         let result = unsafe { libc::mlock(sample_ptr, sample_len) };
-
         if result == 0 {
             log::debug!("CallbackContext sample_buffer locked: {} bytes", sample_len);
-            true
         } else {
             log::warn!(
                 "Failed to lock sample_buffer memory (errno: {})",
                 unsafe { *libc::__error() }
             );
-            false
+            success = false;
         }
+
+        // 锁定 dither_buffer
+        let dither_ptr = self.dither_buffer.as_ptr() as *const libc::c_void;
+        let dither_len = self.dither_buffer.len() * std::mem::size_of::<f32>();
+
+        let result = unsafe { libc::mlock(dither_ptr, dither_len) };
+        if result == 0 {
+            log::debug!("CallbackContext dither_buffer locked: {} bytes", dither_len);
+        } else {
+            log::warn!(
+                "Failed to lock dither_buffer memory (errno: {})",
+                unsafe { *libc::__error() }
+            );
+            success = false;
+        }
+
+        success
     }
 
     /// 解锁上下文内存
@@ -671,6 +756,12 @@ impl CallbackContext {
         let sample_len = self.sample_buffer.len() * std::mem::size_of::<i32>();
         unsafe {
             libc::munlock(sample_ptr, sample_len);
+        }
+
+        let dither_ptr = self.dither_buffer.as_ptr() as *const libc::c_void;
+        let dither_len = self.dither_buffer.len() * std::mem::size_of::<f32>();
+        unsafe {
+            libc::munlock(dither_ptr, dither_len);
         }
     }
 }
@@ -2025,6 +2116,8 @@ impl AudioOutput {
 
         // 预分配 sample_buffer（足够大以处理任何 callback）
         let sample_buffer = vec![0i32; max_samples_per_callback];
+        // 预分配 dither_buffer（用于 SIMD 批量 dither）
+        let dither_buffer = vec![0.0f32; max_samples_per_callback];
 
         // 保存实际格式（使用设备实际采样率，而非源文件采样率）
         self.actual_format = AudioFormat {
@@ -2046,6 +2139,7 @@ impl AudioOutput {
             format: self.actual_format,
             output_layout,
             sample_buffer,
+            dither_buffer,
             dither: DitherState::new(dither_seed),
             output_mode,
             source_bits: format.bits_per_sample,
@@ -2395,11 +2489,17 @@ unsafe fn process_audio_output(
 
             let count = actual_samples.min(output_slice.len());
 
+            // 预生成所有 dither 值到缓冲区，避免 SIMD 循环中断
+            let dither_buffer = &mut ctx.dither_buffer[..count];
+            ctx.dither.fill_tpdf_batch(dither_buffer);
+
             // SIMD 优化路径（4 样本一批）
+            // 现在是纯 SIMD 循环，dither 值已预生成
             #[cfg(target_arch = "aarch64")]
             {
                 use std::arch::aarch64::*;
                 let scale_vec = vdupq_n_f32(I32_TO_FLOAT);
+                let dither_scale_vec = vdupq_n_f32(DITHER_SCALE);
 
                 let chunks = count / 4;
                 for chunk_idx in 0..chunks {
@@ -2410,19 +2510,20 @@ unsafe fn process_audio_output(
                     let f32x4 = vcvtq_f32_s32(i32x4);
                     // 乘以缩放因子
                     let scaled = vmulq_f32(f32x4, scale_vec);
-                    // 添加 dither（标量，因为 dither 需要状态）
-                    let mut result = [0.0f32; 4];
-                    vst1q_f32(result.as_mut_ptr(), scaled);
-                    for j in 0..4 {
-                        let dither = ctx.dither.next_tpdf() * DITHER_SCALE;
-                        output_slice[i + j] = result[j] + dither;
-                    }
+                    // 加载预生成的 dither 值
+                    let dither_vec = vld1q_f32(dither_buffer.as_ptr().add(i));
+                    // 缩放 dither 值
+                    let scaled_dither = vmulq_f32(dither_vec, dither_scale_vec);
+                    // 添加 dither
+                    let result = vaddq_f32(scaled, scaled_dither);
+                    // 存储结果
+                    vst1q_f32(output_slice.as_mut_ptr().add(i), result);
                 }
 
-                // 处理剩余样本
+                // 处理剩余样本（标量）
                 for i in (chunks * 4)..count {
                     let sample = sample_buffer[i] as f32 * I32_TO_FLOAT;
-                    let dither = ctx.dither.next_tpdf() * DITHER_SCALE;
+                    let dither = dither_buffer[i] * DITHER_SCALE;
                     output_slice[i] = sample + dither;
                 }
             }
@@ -2432,7 +2533,7 @@ unsafe fn process_audio_output(
             {
                 for i in 0..count {
                     let sample = sample_buffer[i] as f32 * I32_TO_FLOAT;
-                    let dither = ctx.dither.next_tpdf() * DITHER_SCALE;
+                    let dither = dither_buffer[i] * DITHER_SCALE;
                     output_slice[i] = sample + dither;
                 }
             }
