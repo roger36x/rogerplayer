@@ -186,7 +186,7 @@ impl<T: Copy + Default> RingBuffer<T> {
     /// 返回实际读取的样本数
     /// 此函数是 wait-free 的，绝不阻塞
     ///
-    /// 优化：使用批量拷贝代替逐元素循环，利用 SIMD memcpy
+    /// 优化：使用批量拷贝 + prefetch 隐藏 L2→L1 延迟
     #[inline]
     pub fn read(&self, output: &mut [T]) -> usize {
         let read = self.read_pos.0.load(Ordering::Relaxed);
@@ -203,6 +203,17 @@ impl<T: Copy + Default> RingBuffer<T> {
         let read_idx = read & self.mask;
         // 到缓冲区末尾的连续数据
         let first_part = (self.capacity - read_idx).min(to_read);
+
+        // Prefetch 即将读取的数据到 L1 cache（PRFM PLDL1KEEP）
+        // 预取前 2 条 cache line（256 字节 ≈ 64 个 i32 样本）
+        #[cfg(target_arch = "aarch64")]
+        unsafe {
+            let src = self.buffer[read_idx].get() as *const u8;
+            std::arch::asm!("prfm pldl1keep, [{addr}]", addr = in(reg) src, options(nostack, preserves_flags));
+            if first_part * std::mem::size_of::<T>() > 128 {
+                std::arch::asm!("prfm pldl1keep, [{addr}]", addr = in(reg) src.add(128), options(nostack, preserves_flags));
+            }
+        }
 
         // 批量拷贝第一段（到缓冲区末尾）
         unsafe {
@@ -232,9 +243,13 @@ impl<T: Copy + Default> RingBuffer<T> {
     }
 
     /// 获取当前可写空间
+    ///
+    /// 直接计算，避免通过 available() 间接做两次 Acquire load
     #[inline]
     pub fn free_space(&self) -> usize {
-        self.capacity - self.available()
+        let write = self.write_pos.0.load(Ordering::Relaxed);
+        let read = self.read_pos.0.load(Ordering::Acquire);
+        self.capacity - write.wrapping_sub(read)
     }
 
     /// 获取容量

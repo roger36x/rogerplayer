@@ -287,6 +287,20 @@ fn handle_key_event(app: &mut App, code: KeyCode) {
                 app.playlist_state.select(Some(new_index));
             }
         }
+        KeyCode::Char('g') => {
+            if !app.playlist.is_empty() {
+                app.last_selection_time = Some(Instant::now());
+                app.show_cursor = true;
+                app.playlist_state.select(Some(0));
+            }
+        }
+        KeyCode::Char('G') => {
+            if !app.playlist.is_empty() {
+                app.last_selection_time = Some(Instant::now());
+                app.show_cursor = true;
+                app.playlist_state.select(Some(app.playlist.len() - 1));
+            }
+        }
         KeyCode::Enter => {
             if let Some(i) = app.playlist_state.selected() {
                 app.current_index = i;

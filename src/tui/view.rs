@@ -513,6 +513,7 @@ fn draw_help(f: &mut Frame) {
         ("SPACE", "Pause / Resume"),
         ("n / p", "Next / Previous track"),
         ("↑ / ↓", "Navigate playlist"),
+        ("g / G", "Jump to first / last"),
         ("Enter", "Play selected track"),
         ("/", "Search songs"),
         ("s", "Toggle shuffle"),

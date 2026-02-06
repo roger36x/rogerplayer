@@ -50,12 +50,12 @@ impl TimebaseInfo {
 ///
 /// 注意：Intel Mac 上 timebase 通常是 1/1
 /// Apple Silicon 上通常是 125/3 (约 41.67ns/tick)
+///
+/// 使用 u128 中间值防止大 ticks 值溢出（>39 天连续运行时 u64 会溢出）
 #[inline]
 pub fn mach_ticks_to_ns(ticks: u64) -> u64 {
     let info = TimebaseInfo::get();
-    // 注意：先乘后除可能溢出，但对于典型的 timebase (1/1 或 125/3) 和
-    // 合理的 interval (< 1秒)，不会溢出
-    ticks * info.numer as u64 / info.denom as u64
+    (ticks as u128 * info.numer as u128 / info.denom as u128) as u64
 }
 
 /// 将纳秒转换为 mach ticks
@@ -65,7 +65,7 @@ pub fn mach_ticks_to_ns(ticks: u64) -> u64 {
 #[inline]
 pub fn ns_to_mach_ticks(ns: u64) -> u64 {
     let info = TimebaseInfo::get();
-    ns * info.denom as u64 / info.numer as u64
+    (ns as u128 * info.denom as u128 / info.numer as u128) as u64
 }
 
 /// 获取当前时间（mach ticks）

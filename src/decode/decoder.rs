@@ -351,7 +351,6 @@ impl DoubleBuffer {
         let next = 1 - self.active;
         let current = self.active;
         let pos = self.position;
-        let len = self.len;
 
         // 确保目标缓冲区容量足够
         let needed = remaining + new_data.len();
@@ -367,13 +366,19 @@ impl DoubleBuffer {
             (&second[0], &mut first[0])
         };
 
-        // 清空目标缓冲区并复制剩余数据
-        dst_buf.clear();
-        if remaining > 0 {
-            dst_buf.extend_from_slice(&src_buf[pos..len]);
+        // 批量拷贝：剩余数据 + 新数据，用 copy_nonoverlapping 代替 extend_from_slice
+        let total = remaining + new_data.len();
+        if dst_buf.capacity() < total {
+            dst_buf.reserve(total - dst_buf.len());
         }
-        // 追加新数据
-        dst_buf.extend_from_slice(new_data);
+        unsafe {
+            let dst = dst_buf.as_mut_ptr();
+            if remaining > 0 {
+                std::ptr::copy_nonoverlapping(src_buf.as_ptr().add(pos), dst, remaining);
+            }
+            std::ptr::copy_nonoverlapping(new_data.as_ptr(), dst.add(remaining), new_data.len());
+            dst_buf.set_len(total);
+        }
 
         // 切换
         self.active = next;
@@ -381,12 +386,22 @@ impl DoubleBuffer {
         self.position = 0;
     }
 
-    /// 直接追加数据到当前缓冲区（当缓冲区为空时使用）
+    /// 直接设置数据源（当缓冲区为空时使用）
+    ///
+    /// 使用 unsafe 的 set_len + copy_nonoverlapping 代替 extend_from_slice，
+    /// 避免逐元素 Clone（虽然 i32 是 Copy，编译器通常会优化，但显式 memcpy 更确定）
     fn append(&mut self, data: &[i32]) {
         let buf = &mut self.buffers[self.active];
-        buf.clear();
-        buf.extend_from_slice(data);
-        self.len = buf.len();
+        let len = data.len();
+        // 容量已预分配（MAX_SAMPLES_PER_DECODE * 2），正常情况不触发分配
+        if buf.capacity() < len {
+            buf.reserve(len - buf.len());
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(data.as_ptr(), buf.as_mut_ptr(), len);
+            buf.set_len(len);
+        }
+        self.len = len;
         self.position = 0;
     }
 }
@@ -619,10 +634,19 @@ fn convert_s24_to_i32_stereo_neon(
 }
 
 /// 转换 i32 样本（直接复制）
+///
+/// 立体声 NEON 优化：vld1q + vst2q 交织写入
 #[inline]
 fn convert_s32_to_i32(buf: &AudioBuffer<i32>, output: &mut [i32]) {
     let channels = buf.spec().channels.count();
     let frames = buf.frames();
+
+    #[cfg(target_arch = "aarch64")]
+    if channels == 2 {
+        convert_s32_to_i32_stereo_neon(buf, output, frames);
+        return;
+    }
+
     for frame in 0..frames {
         for ch in 0..channels {
             output[frame * channels + ch] = buf.chan(ch)[frame];
@@ -630,17 +654,103 @@ fn convert_s32_to_i32(buf: &AudioBuffer<i32>, output: &mut [i32]) {
     }
 }
 
+/// NEON 优化的立体声 i32→i32 交织拷贝
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn convert_s32_to_i32_stereo_neon(buf: &AudioBuffer<i32>, output: &mut [i32], frames: usize) {
+    use std::arch::aarch64::*;
+
+    let left = buf.chan(0);
+    let right = buf.chan(1);
+    let chunks = frames / 4;
+
+    for chunk in 0..chunks {
+        let i = chunk * 4;
+        unsafe {
+            let left_s32 = vld1q_s32(left.as_ptr().add(i));
+            let right_s32 = vld1q_s32(right.as_ptr().add(i));
+            let pair = int32x4x2_t(left_s32, right_s32);
+            vst2q_s32(output.as_mut_ptr().add(i * 2), pair);
+        }
+    }
+
+    for frame in (chunks * 4)..frames {
+        let out_idx = frame * 2;
+        output[out_idx] = left[frame];
+        output[out_idx + 1] = right[frame];
+    }
+}
+
 /// 转换 f32 样本到 i32 左对齐
+///
+/// 立体声 NEON 优化：向量化 clamp + f32→i32 转换
 #[inline]
 fn convert_f32_to_i32(buf: &AudioBuffer<f32>, output: &mut [i32]) {
     let channels = buf.spec().channels.count();
     let frames = buf.frames();
+
+    #[cfg(target_arch = "aarch64")]
+    if channels == 2 {
+        convert_f32_to_i32_stereo_neon(buf, output, frames);
+        return;
+    }
+
     for frame in 0..frames {
         for ch in 0..channels {
             let sample = buf.chan(ch)[frame];
             let clamped = sample.clamp(-1.0, 1.0);
             output[frame * channels + ch] = (clamped * i32::MAX as f32) as i32;
         }
+    }
+}
+
+/// NEON 优化的立体声 f32→i32 转换
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn convert_f32_to_i32_stereo_neon(buf: &AudioBuffer<f32>, output: &mut [i32], frames: usize) {
+    use std::arch::aarch64::*;
+
+    let left = buf.chan(0);
+    let right = buf.chan(1);
+    let chunks = frames / 4;
+
+    unsafe {
+        let min_val = vdupq_n_f32(-1.0);
+        let max_val = vdupq_n_f32(1.0);
+        let scale = vdupq_n_f32(i32::MAX as f32);
+
+        for chunk in 0..chunks {
+            let i = chunk * 4;
+
+            // 加载 4 个左/右声道样本
+            let left_f32 = vld1q_f32(left.as_ptr().add(i));
+            let right_f32 = vld1q_f32(right.as_ptr().add(i));
+
+            // clamp [-1.0, 1.0]
+            let left_clamped = vminq_f32(vmaxq_f32(left_f32, min_val), max_val);
+            let right_clamped = vminq_f32(vmaxq_f32(right_f32, min_val), max_val);
+
+            // 乘以 i32::MAX
+            let left_scaled = vmulq_f32(left_clamped, scale);
+            let right_scaled = vmulq_f32(right_clamped, scale);
+
+            // f32 → i32
+            let left_i32 = vcvtq_s32_f32(left_scaled);
+            let right_i32 = vcvtq_s32_f32(right_scaled);
+
+            // 交织写入
+            let pair = int32x4x2_t(left_i32, right_i32);
+            vst2q_s32(output.as_mut_ptr().add(i * 2), pair);
+        }
+    }
+
+    // 剩余帧标量处理
+    for frame in (chunks * 4)..frames {
+        let out_idx = frame * 2;
+        let l = left[frame].clamp(-1.0, 1.0);
+        let r = right[frame].clamp(-1.0, 1.0);
+        output[out_idx] = (l * i32::MAX as f32) as i32;
+        output[out_idx + 1] = (r * i32::MAX as f32) as i32;
     }
 }
 

@@ -493,7 +493,8 @@ impl DitherState {
     ///
     /// 连续生成 DITHER_BATCH_SIZE 个 TPDF 值
     /// 这样可以让 CPU 更好地预测分支和预取数据
-    #[inline(always)]
+    /// 每 64 样本调用一次，不必强制内联以免 icache 膨胀
+    #[inline]
     fn refill_batch(&mut self) {
         const SCALE: f32 = 1.0 / 16777216.0; // 2^-24
 
@@ -566,30 +567,22 @@ pub enum OutputFormatMode {
 ///
 /// 所有字段在 callback 启动前预分配，callback 内不做任何分配
 /// 内存通过 mlock 锁定，防止 page fault
+///
+/// 字段按访问频率排列：热字段在前（每次 callback 访问），
+/// 冷字段在后（一次性或外部线程访问），减少 cache miss
 pub struct CallbackContext {
+    // === 热字段：每次 callback 都访问 ===
     pub ring_buffer: Arc<RingBuffer<i32>>,
     pub stats: Arc<PlaybackStats>,
+    pub sample_buffer: Vec<i32>,
+    pub dither_buffer: Vec<f32>,
+    pub dither: DitherState,
+    pub output_mode: OutputFormatMode,
     pub format: AudioFormat,
     pub output_layout: OutputLayout,
-
-    /// 预分配的样本缓冲区（i32，保证对齐）
-    pub sample_buffer: Vec<i32>,
-
-    /// 预分配的 dither 缓冲区（f32，用于 SIMD 批量处理）
-    /// 大小与 sample_buffer 相同，避免 callback 中分配
-    pub dither_buffer: Vec<f32>,
-
-    /// TPDF dither 状态
-    pub dither: DitherState,
-
-    /// 输出格式模式
-    pub output_mode: OutputFormatMode,
-
-    /// 源文件位深（用于判断是否需要 dither）
-    /// 当输出位深 >= 源位深时，无需 dither（bit-perfect）
     pub source_bits: u16,
 
-    /// 设备实际 buffer frames（用于 thread policy 计算）
+    // === 冷字段：一次性或外部访问 ===
     pub buffer_frames: u32,
 
     /// 是否正在运行
