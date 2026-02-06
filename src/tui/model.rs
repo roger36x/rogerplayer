@@ -535,17 +535,23 @@ impl App {
         self.shuffle_order.iter().position(|&i| i == self.current_index)
     }
 
-    /// 更新统计信息
-    pub fn on_tick(&mut self) {
-        self.cached_stats = self.engine.stats();
-
-        // 自动切歌检测
+    /// 轻量级曲目结束检测
+    ///
+    /// 仅读取 eof_reached (AtomicBool)，播放中几乎零开销。
+    /// 只有 eof_reached=true 时才进一步检查 ring_buffer.available()。
+    /// 从主循环高频调用（每次输入轮询），不读取统计信息。
+    pub fn check_track_end(&mut self) -> bool {
         if self.engine.is_track_finished() {
             self.log("Track finished".to_string());
-            self.go_to_next(true); // 自动切歌
+            self.go_to_next(true);
+            true
+        } else {
+            false
         }
+    }
 
-        // 10秒无选曲操作，自动回位到当前播放曲目并隐藏光标
+    /// 选曲光标超时检查（纯本地状态，无原子操作）
+    pub fn check_cursor_timeout(&mut self) {
         if let Some(last_time) = self.last_selection_time {
             if last_time.elapsed() > Duration::from_secs(10) {
                 self.playlist_state.select(Some(self.current_index));
@@ -553,6 +559,15 @@ impl App {
                 self.show_cursor = false;
             }
         }
+    }
+
+    /// 更新统计信息（仅在绘制前调用）
+    ///
+    /// 读取引擎统计会访问 ring_buffer 的 write_pos/read_pos 原子变量，
+    /// 导致音频线程的 cache line 失效。因此仅在即将绘制时才读取，
+    /// 播放中约每 500ms 一次（而非之前的 50ms），减少 10 倍 cache 干扰。
+    pub fn update_stats(&mut self) {
+        self.cached_stats = self.engine.stats();
     }
 
     /// 执行搜索

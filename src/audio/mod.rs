@@ -16,4 +16,4 @@ pub mod timing;
 pub use format::AudioFormat;
 pub use output::{AudioOutput, OutputConfig, OutputError};
 pub use ring_buffer::RingBuffer;
-pub use stats::{PlaybackStats, StatsReport};
+pub use stats::PlaybackStats;

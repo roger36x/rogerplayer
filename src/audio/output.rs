@@ -589,6 +589,9 @@ pub struct CallbackContext {
     /// 当输出位深 >= 源位深时，无需 dither（bit-perfect）
     pub source_bits: u16,
 
+    /// 设备实际 buffer frames（用于 thread policy 计算）
+    pub buffer_frames: u32,
+
     /// 是否正在运行
     /// 使用 CacheLine 包装避免与 thread_policy_set 的 false sharing
     /// （running 被外部线程写入，thread_policy_set 被回调线程读写）
@@ -626,31 +629,9 @@ mod thread_policy {
         ) -> i32;
     }
 
-    #[repr(C)]
-    pub struct MachTimebaseInfo {
-        pub numer: u32,
-        pub denom: u32,
-    }
-
-    #[link(name = "System")]
-    extern "C" {
-        pub fn mach_timebase_info(info: *mut MachTimebaseInfo) -> i32;
-    }
-
-    /// 获取 Mach timebase 信息
-    pub fn get_timebase_info() -> (u32, u32) {
-        let mut info = MachTimebaseInfo { numer: 0, denom: 0 };
-        unsafe {
-            mach_timebase_info(&mut info);
-        }
-        (info.numer, info.denom)
-    }
-
-    /// 将纳秒转换为 Mach ticks
+    /// 将纳秒转换为 Mach ticks（委托给 timing 模块）
     pub fn ns_to_ticks(ns: u64) -> u32 {
-        let (numer, denom) = get_timebase_info();
-        // ticks = ns * denom / numer
-        ((ns * denom as u64) / numer as u64) as u32
+        crate::audio::timing::ns_to_mach_ticks(ns) as u32
     }
 }
 
@@ -669,8 +650,7 @@ impl CallbackContext {
         use thread_policy::*;
 
         // 计算回调周期（纳秒）
-        // 假设 512 frames @ 48kHz = ~10.67ms
-        let buffer_frames = 512u64;
+        let buffer_frames = self.buffer_frames as u64;
         let sample_rate = self.format.sample_rate as u64;
         let period_ns = buffer_frames * 1_000_000_000 / sample_rate;
 
@@ -696,14 +676,44 @@ impl CallbackContext {
             )
         };
 
+        // 设置线程亲和性标签（音频组 tag 1）
+        // 与解码线程同组，与 TUI 线程（tag 2）分离
+        Self::set_io_thread_affinity();
+
         if result == 0 {
-            // 使用 eprintln 而不是 log，因为在回调中不能使用 log
-            // 实际上这个函数只会在第一次回调时被调用一次
             true
         } else {
             false
         }
     }
+
+    /// 设置 IO 回调线程的亲和性标签（音频组 tag 1）
+    ///
+    /// 与解码线程共享 tag 1，有利于 ring buffer 数据的 cache 命中。
+    /// 与 TUI 线程（tag 2）分离，避免 UI 渲染的 cache pollution。
+    #[cfg(target_os = "macos")]
+    fn set_io_thread_affinity() {
+        const THREAD_AFFINITY_POLICY: u32 = 4;
+
+        #[repr(C)]
+        struct ThreadAffinityPolicy {
+            affinity_tag: i32,
+        }
+
+        unsafe {
+            let thread = thread_policy::mach_thread_self();
+            let policy = ThreadAffinityPolicy { affinity_tag: 1 };
+            thread_policy::thread_policy_set(
+                thread,
+                THREAD_AFFINITY_POLICY,
+                &policy as *const _ as *const std::ffi::c_void,
+                1,
+            );
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn set_io_thread_affinity() {}
 
     #[cfg(not(target_os = "macos"))]
     pub fn set_realtime_thread_policy(&self) -> bool {
@@ -2117,8 +2127,8 @@ impl AudioOutput {
         } else {
             4096  // DefaultOutput 使用较大缓冲区
         };
-        // 使用更大的缓冲区以处理可变的 callback 大小
-        let max_samples_per_callback = buffer_frames.max(8192) as usize * format.channels as usize;
+        // 预分配 2 倍 buffer_frames 作为安全余量（应对偶发的大 callback）
+        let max_samples_per_callback = (buffer_frames * 2) as usize * format.channels as usize;
         log::info!("Buffer frames: {}, max samples: {}", buffer_frames, max_samples_per_callback);
 
         // 查询输出布局
@@ -2153,6 +2163,7 @@ impl AudioOutput {
             dither: DitherState::new(dither_seed),
             output_mode,
             source_bits: format.bits_per_sample,
+            buffer_frames,
             running: CacheLine::new(AtomicBool::new(true)),
             thread_policy_set: CacheLine::new(AtomicBool::new(false)),
         });
@@ -2409,6 +2420,12 @@ unsafe fn process_audio_output(
         return;
     }
 
+    // NonInterleaved 设备：每声道独立 buffer（极罕见，防御性处理）
+    if ctx.output_layout == OutputLayout::NonInterleaved {
+        process_non_interleaved(ctx, buffer_list, samples_needed);
+        return;
+    }
+
     match ctx.output_mode {
         OutputFormatMode::Int32 => {
             // 零拷贝路径：直接从 ring buffer 读取到输出缓冲区
@@ -2555,6 +2572,95 @@ unsafe fn process_audio_output(
     }
 }
 
+/// NonInterleaved 输出处理
+///
+/// 从 ring buffer 读取交织数据，按声道拆分写入各独立 buffer。
+/// 标量实现（NonInterleaved 极罕见，不做 SIMD 优化）。
+#[inline(always)]
+unsafe fn process_non_interleaved(
+    ctx: &mut CallbackContext,
+    buffer_list: &mut AudioBufferList,
+    samples_needed: usize,
+) {
+    let channels = ctx.format.channels as usize;
+    let frames = samples_needed / channels;
+
+    // 读取交织数据到 sample_buffer
+    let actual_samples = samples_needed.min(ctx.sample_buffer.len());
+    let sample_buffer = &mut ctx.sample_buffer[..actual_samples];
+    let samples_read = ctx.ring_buffer.read(sample_buffer);
+    ctx.stats.add_samples_played(samples_read as u64);
+
+    if samples_read < actual_samples {
+        ctx.stats.record_underrun();
+        for i in samples_read..actual_samples {
+            sample_buffer[i] = 0;
+        }
+    }
+
+    let frames_read = samples_read / channels;
+
+    // 按声道拆分到各独立 buffer
+    for ch in 0..channels.min(buffer_list.number_buffers as usize) {
+        let buf = &buffer_list.buffers[ch];
+
+        match ctx.output_mode {
+            OutputFormatMode::Int32 => {
+                let out_ptr = buf.data as *mut i32;
+                let out_frames = buf.data_byte_size as usize / 4;
+                let out_slice = std::slice::from_raw_parts_mut(out_ptr, out_frames);
+                for f in 0..frames.min(out_frames) {
+                    out_slice[f] = if f < frames_read {
+                        sample_buffer[f * channels + ch]
+                    } else {
+                        0
+                    };
+                }
+                for f in frames.min(out_frames)..out_frames {
+                    out_slice[f] = 0;
+                }
+            }
+            OutputFormatMode::Int24 => {
+                let out_ptr = buf.data as *mut u8;
+                let out_bytes = buf.data_byte_size as usize;
+                let out_slice = std::slice::from_raw_parts_mut(out_ptr, out_bytes);
+                let out_frames = out_bytes / 3;
+                for f in 0..frames.min(out_frames) {
+                    let sample = if f < frames_read {
+                        sample_buffer[f * channels + ch]
+                    } else {
+                        0
+                    };
+                    let bytes = sample.to_le_bytes();
+                    out_slice[f * 3] = bytes[1];
+                    out_slice[f * 3 + 1] = bytes[2];
+                    out_slice[f * 3 + 2] = bytes[3];
+                }
+                for i in (frames.min(out_frames) * 3)..out_bytes {
+                    out_slice[i] = 0;
+                }
+            }
+            OutputFormatMode::Float32 => {
+                let out_ptr = buf.data as *mut f32;
+                let out_frames = buf.data_byte_size as usize / 4;
+                let out_slice = std::slice::from_raw_parts_mut(out_ptr, out_frames);
+                const I32_TO_FLOAT: f32 = 1.0 / 2147483648.0;
+                for f in 0..frames.min(out_frames) {
+                    let sample = if f < frames_read {
+                        sample_buffer[f * channels + ch]
+                    } else {
+                        0
+                    };
+                    out_slice[f] = sample as f32 * I32_TO_FLOAT;
+                }
+                for f in frames.min(out_frames)..out_frames {
+                    out_slice[f] = 0.0;
+                }
+            }
+        }
+    }
+}
+
 /// Render Callback (AudioUnit)
 ///
 /// **绝对禁止：**
@@ -2565,7 +2671,7 @@ unsafe fn process_audio_output(
 extern "C" fn render_callback(
     in_ref_con: *mut c_void,
     _io_action_flags: *mut u32,
-    in_time_stamp: *const AudioTimeStamp,
+    _in_time_stamp: *const AudioTimeStamp,
     _in_bus_number: u32,
     in_number_frames: u32,
     io_data: *mut AudioBufferList,
@@ -2587,10 +2693,6 @@ extern "C" fn render_callback(
     let frames = in_number_frames as usize;
     let channels = ctx.format.channels as usize;
     let samples_needed = frames * channels;
-
-    // 统计
-    let host_time = unsafe { (*in_time_stamp).valid_host_time() };
-    ctx.stats.on_callback_with_timestamp(&ctx.ring_buffer, host_time);
 
     // 调用共享的音频处理逻辑
     let buffer_list = unsafe { &mut *io_data };

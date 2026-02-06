@@ -217,6 +217,7 @@ impl Engine {
         let prebuffer_ratio = self.config.prebuffer_ratio;
         let channels = info.channels as usize;
         let sample_rate = source_sample_rate;
+        let buffer_frames = self.config.output.buffer_frames;
 
         let decoder_thread = thread::Builder::new()
             .name("decoder".to_string())
@@ -228,6 +229,7 @@ impl Engine {
                     prebuffer_ratio,
                     channels,
                     sample_rate,
+                    buffer_frames,
                 );
             })
             .expect("Failed to spawn decoder thread");
@@ -252,9 +254,10 @@ impl Engine {
         prebuffer_ratio: f64,
         channels: usize,
         sample_rate: u32,
+        buffer_frames: u32,
     ) {
         // 设置较高的线程优先级（但不是实时，避免影响 CoreAudio IO 线程）
-        Self::set_decoder_thread_priority();
+        Self::set_decoder_thread_priority(buffer_frames, sample_rate);
 
         let mut iter = DecoderIterator::new(decoder);
 
@@ -265,35 +268,23 @@ impl Engine {
         // 读取块大小
         let read_chunk_size = 4096 * channels;
 
-        // 自适应等待参数
-        // 计算消耗速率：每微秒消耗多少样本
-        // samples_per_us = sample_rate * channels / 1_000_000
-        let samples_per_us = (sample_rate as u64 * channels as u64) as f64 / 1_000_000.0;
+        // 自适应等待参数（纯整数运算，避免热路径上的 f64 除法）
+        // ns_per_sample = 1_000_000_000 / (sample_rate * channels)
+        let ns_per_sample: u64 = 1_000_000_000 / (sample_rate as u64 * channels as u64);
         let min_free_threshold = 1024 * channels;
 
         log::info!(
-            "Decoder thread started, prebuffer target: {} samples, consumption rate: {:.2} samples/µs",
+            "Decoder thread started, prebuffer target: {} samples, ~{}ns/sample",
             prebuffer_samples,
-            samples_per_us
+            ns_per_sample
         );
 
         while state.running.load(Ordering::Acquire) {
-            // 检查暂停 - 使用 spin + yield 等待，完全无锁
-            // 比 Condvar 更简单，避免 Mutex 的优先级反转风险
-            if state.paused.load(Ordering::Acquire) {
-                // 短暂自旋（适合极短暂停）
-                for _ in 0..16 {
-                    std::hint::spin_loop();
-                    if !state.paused.load(Ordering::Relaxed) {
-                        break;
-                    }
-                }
-                // 仍在暂停则让出 CPU 并短暂睡眠
-                if state.paused.load(Ordering::Acquire) {
-                    thread::yield_now();
-                    thread::sleep(std::time::Duration::from_millis(10));
-                }
-                continue;
+            // 检查暂停 - 使用 thread::park 阻塞等待，完全无锁
+            // park/unpark 无需 Mutex（避免优先级反转），恢复延迟 ~1-10µs
+            // 如果 unpark 在 park 之前调用，下次 park 立即返回（无丢失唤醒）
+            while state.paused.load(Ordering::Acquire) {
+                thread::park();
             }
 
             // 检查缓冲区是否有空间
@@ -303,7 +294,7 @@ impl Engine {
                 // 缓冲区快满了 - 使用自适应等待策略
                 // 计算需要等待多久才能有足够空间
                 let samples_needed = min_free_threshold - available_write;
-                let wait_us = (samples_needed as f64 / samples_per_us) as u64;
+                let wait_us = (samples_needed as u64 * ns_per_sample) / 1_000;
 
                 // 根据等待时间选择策略：
                 // - < 50µs: 仅自旋（避免 syscall 开销）
@@ -322,7 +313,7 @@ impl Engine {
                     }
                 } else {
                     // 长等待：睡眠 70% 的预计时间（留出余量）
-                    let sleep_us = (wait_us * 7 / 10).max(100).min(2000);
+                    let sleep_us = (wait_us * 7 / 10).max(100).min(10_000);
                     thread::sleep(std::time::Duration::from_micros(sleep_us));
                 }
                 continue;
@@ -369,14 +360,18 @@ impl Engine {
     /// 1. QoS 标记 - 告诉系统这是用户交互敏感任务（总是成功）
     /// 2. 实时调度策略 - 使用 Mach THREAD_TIME_CONSTRAINT_POLICY（不需要 root）
     /// 3. 后备方案 - nice 值
-    fn set_decoder_thread_priority() {
+    fn set_decoder_thread_priority(buffer_frames: u32, sample_rate: u32) {
         #[cfg(target_os = "macos")]
         {
             // === 1. 设置 QoS 类（总是成功，无需权限）===
             Self::set_qos_class();
 
             // === 2. 设置实时调度策略（不需要 root）===
-            Self::set_realtime_priority();
+            Self::set_realtime_priority(buffer_frames, sample_rate);
+
+            // === 3. 设置线程亲和性标签（音频组 tag 1）===
+            // 与 TUI 线程（tag 2）分离，减少 cache 干扰
+            Self::set_audio_thread_affinity();
         }
     }
 
@@ -402,16 +397,55 @@ impl Engine {
         }
     }
 
+    /// 设置线程亲和性标签（音频组 tag 1）
+    ///
+    /// 将解码线程标记为音频组，与 IO 回调线程同组（tag 1），
+    /// 与 TUI 线程（tag 2）分离。macOS 调度器会：
+    /// - 将同 tag 线程调度到相邻核心（共享 L2 cache，有利于 ring buffer 访问）
+    /// - 将不同 tag 线程调度到不同核心组（减少 cache pollution）
+    #[cfg(target_os = "macos")]
+    fn set_audio_thread_affinity() {
+        const THREAD_AFFINITY_POLICY: u32 = 4;
+
+        #[repr(C)]
+        struct ThreadAffinityPolicy {
+            affinity_tag: i32,
+        }
+
+        extern "C" {
+            fn pthread_mach_thread_np(thread: libc::pthread_t) -> u32;
+            fn thread_policy_set(
+                thread: u32,
+                flavor: u32,
+                policy_info: *const std::ffi::c_void,
+                count: u32,
+            ) -> i32;
+        }
+
+        unsafe {
+            let thread = pthread_mach_thread_np(libc::pthread_self());
+            let policy = ThreadAffinityPolicy { affinity_tag: 1 };
+            let result = thread_policy_set(
+                thread,
+                THREAD_AFFINITY_POLICY,
+                &policy as *const _ as *const std::ffi::c_void,
+                1,
+            );
+            if result == 0 {
+                log::debug!("Decoder thread affinity tag set to 1 (audio group)");
+            }
+        }
+    }
+
     /// 设置 Mach 实时调度策略
     ///
-    /// 使用 THREAD_TIME_CONSTRAINT_POLICY 告诉调度器：
-    /// - period: 解码周期（5ms）
-    /// - computation: 每周期需要的计算时间（2ms）
-    /// - constraint: 最大延迟容忍（4ms）
-    ///
-    /// 这不需要 root 权限，系统会尽量满足请求
+    /// 使用 THREAD_TIME_CONSTRAINT_POLICY，period 基于设备 buffer 大小动态计算。
+    /// 使用 timing::ns_to_mach_ticks 正确转换纳秒到 Mach ticks
+    /// （Apple Silicon 上 1 tick ≈ 41.67ns，不等于 1ns）。
     #[cfg(target_os = "macos")]
-    fn set_realtime_priority() {
+    fn set_realtime_priority(buffer_frames: u32, sample_rate: u32) {
+        use crate::audio::timing::ns_to_mach_ticks;
+
         #[repr(C)]
         struct ThreadTimeConstraintPolicy {
             period: u32,
@@ -432,21 +466,25 @@ impl Engine {
             ) -> i32;
         }
 
+        // 基于设备 buffer 大小计算周期，不低于 1ms
+        let callback_period_ns = buffer_frames as u64 * 1_000_000_000 / sample_rate as u64;
+        let period_ns = callback_period_ns.max(1_000_000);
+        let computation_ns = period_ns / 2;
+
+        let period_ticks = ns_to_mach_ticks(period_ns) as u32;
+        let computation_ticks = ns_to_mach_ticks(computation_ns) as u32;
+        let constraint_ticks = period_ticks;
+
         unsafe {
             let thread = pthread_mach_thread_np(libc::pthread_self());
 
-            // 时间约束策略（单位：Mach 绝对时间，约等于纳秒）
-            // period: 5ms - 解码周期
-            // computation: 2ms - 每周期需要的计算时间
-            // constraint: 4ms - 必须在这个时间内完成
             let policy = ThreadTimeConstraintPolicy {
-                period: 5_000_000,       // 5ms
-                computation: 2_000_000,  // 2ms
-                constraint: 4_000_000,   // 4ms
-                preemptible: 1,          // 可被更高优先级抢占
+                period: period_ticks,
+                computation: computation_ticks,
+                constraint: constraint_ticks,
+                preemptible: 1,
             };
 
-            // count = struct 中 u32 的数量
             let result = thread_policy_set(
                 thread,
                 THREAD_TIME_CONSTRAINT_POLICY,
@@ -456,14 +494,14 @@ impl Engine {
 
             if result == 0 {
                 log::debug!(
-                    "Realtime priority set: period=5ms, computation=2ms, constraint=4ms"
+                    "Realtime priority set: period={}µs, computation={}µs (from {}frames@{}Hz)",
+                    period_ns / 1000, computation_ns / 1000, buffer_frames, sample_rate
                 );
             } else {
                 log::debug!(
                     "Failed to set realtime priority (kern_return: {}), using default scheduling",
                     result
                 );
-                // 后备方案：设置 nice 值
                 libc::setpriority(libc::PRIO_PROCESS, 0, -10);
             }
         }
@@ -475,6 +513,10 @@ impl Engine {
         self.decoder_state.running.store(false, Ordering::Release);
         // 解除暂停状态（如果有），确保解码线程能退出
         self.decoder_state.paused.store(false, Ordering::Release);
+        // 唤醒可能 park 的解码线程
+        if let Some(ref handle) = self.decoder_thread {
+            handle.thread().unpark();
+        }
 
         if let Some(thread) = self.decoder_thread.take() {
             let _ = thread.join();
@@ -521,8 +563,12 @@ impl Engine {
                 if let Some(ref mut output) = self.output {
                     output.resume()?;
                 }
-                // 恢复解码线程（原子写入，解码线程会在下次循环检测到）
+                // 恢复解码线程
                 self.decoder_state.paused.store(false, Ordering::Release);
+                // 立即唤醒 park 中的解码线程（~1-10µs 延迟）
+                if let Some(ref handle) = self.decoder_thread {
+                    handle.thread().unpark();
+                }
                 self.state = PlaybackState::Playing;
                 log::info!("Resumed");
             }
@@ -565,13 +611,6 @@ impl Engine {
             samples_played,
             position_secs,
         }
-    }
-
-    /// 获取详细统计报告
-    pub fn stats_report(&self) -> Option<crate::audio::StatsReport> {
-        let info = self.current_info.as_ref()?;
-        let buffer_frames = self.config.output.buffer_frames;
-        Some(self.stats.report(buffer_frames, info.sample_rate))
     }
 
     /// 获取当前文件信息

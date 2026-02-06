@@ -7,10 +7,14 @@
 
 #![allow(dead_code, unused_mut)]
 
+mod alloc;
 mod audio;
 mod decode;
 mod engine;
 mod tui;
+
+#[global_allocator]
+static GLOBAL: alloc::TuiIsolatedAllocator = alloc::TuiIsolatedAllocator;
 
 use std::ffi::OsStr;
 use std::io::{self, Read as IoRead, Write};

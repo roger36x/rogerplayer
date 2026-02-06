@@ -410,11 +410,11 @@ fn draw_dialog(f: &mut Frame, app: &App) {
         // 清除弹窗区域的背景内容
         f.render_widget(Clear, dialog_area);
 
-        // 弹窗边框（带黑色背景填充）
+        // 弹窗边框（跟随终端主题背景色）
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::Cyan))
-            .style(Style::default().bg(Color::Black))
+            .style(Style::default().bg(Color::Reset))
             .title(" Select Output Mode ");
 
         f.render_widget(block, dialog_area);
@@ -429,10 +429,10 @@ fn draw_dialog(f: &mut Frame, app: &App) {
 
         let mut lines = Vec::new();
 
-        // 说明文字
+        // 说明文字（使用终端默认前景色）
         lines.push(Line::from(Span::styled(
             "Choose audio output mode:",
-            Style::default().fg(Color::White),
+            Style::default().fg(Color::Reset),
         )));
         lines.push(Line::from(""));
 
@@ -440,7 +440,7 @@ fn draw_dialog(f: &mut Frame, app: &App) {
         let hal_style = if *selected == OutputModeChoice::HalExclusive {
             Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::White)
+            Style::default().fg(Color::Reset)
         };
         let hal_prefix = if *selected == OutputModeChoice::HalExclusive { "> " } else { "  " };
         lines.push(Line::from(Span::styled(
@@ -449,7 +449,7 @@ fn draw_dialog(f: &mut Frame, app: &App) {
         )));
         lines.push(Line::from(Span::styled(
             "      Best quality, bit-perfect",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(Color::Gray),
         )));
 
         lines.push(Line::from(""));
@@ -458,7 +458,7 @@ fn draw_dialog(f: &mut Frame, app: &App) {
         let mixer_style = if *selected == OutputModeChoice::SystemMixer {
             Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::White)
+            Style::default().fg(Color::Reset)
         };
         let mixer_prefix = if *selected == OutputModeChoice::SystemMixer { "> " } else { "  " };
         lines.push(Line::from(Span::styled(
@@ -467,7 +467,7 @@ fn draw_dialog(f: &mut Frame, app: &App) {
         )));
         lines.push(Line::from(Span::styled(
             "      Compatible, allows mixing",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(Color::Gray),
         )));
 
         let paragraph = Paragraph::new(lines);
@@ -492,11 +492,11 @@ fn draw_help(f: &mut Frame) {
     // 清除弹窗区域的背景内容
     f.render_widget(Clear, dialog_area);
 
-    // 弹窗边框
+    // 弹窗边框（跟随终端主题背景色）
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan))
-        .style(Style::default().bg(Color::Black))
+        .style(Style::default().bg(Color::Reset))
         .title(" Help ");
 
     f.render_widget(block, dialog_area);
@@ -537,7 +537,7 @@ fn draw_help(f: &mut Frame) {
             } else {
                 Line::from(vec![
                     Span::styled(format!("{:<12}", key), Style::default().fg(Color::Cyan)),
-                    Span::styled(*desc, Style::default().fg(Color::White)),
+                    Span::styled(*desc, Style::default().fg(Color::Reset)),
                 ])
             }
         })

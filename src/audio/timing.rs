@@ -58,6 +58,16 @@ pub fn mach_ticks_to_ns(ticks: u64) -> u64 {
     ticks * info.numer as u64 / info.denom as u64
 }
 
+/// 将纳秒转换为 mach ticks
+///
+/// `mach_ticks_to_ns` 的反向转换。
+/// 用于设置 THREAD_TIME_CONSTRAINT_POLICY 等需要 Mach ticks 的 API。
+#[inline]
+pub fn ns_to_mach_ticks(ns: u64) -> u64 {
+    let info = TimebaseInfo::get();
+    ns * info.denom as u64 / info.numer as u64
+}
+
 /// 获取当前时间（mach ticks）
 #[cfg(target_os = "macos")]
 #[inline]
@@ -102,6 +112,23 @@ mod tests {
         // 对于 1/1 timebase，应该相等
         // 对于 125/3 timebase，ns ≈ ticks * 41.67
         assert!(ns > 0);
+    }
+
+    #[test]
+    fn test_ns_to_mach_ticks_roundtrip() {
+        // ns → ticks → ns 应该近似还原（整数除法可能有微小误差）
+        let original_ns: u64 = 5_000_000; // 5ms
+        let ticks = ns_to_mach_ticks(original_ns);
+        let recovered_ns = mach_ticks_to_ns(ticks);
+
+        // 误差不超过 1 tick 对应的纳秒
+        let info = TimebaseInfo::get();
+        let max_error = info.numer as u64 / info.denom as u64 + 1;
+        assert!(
+            (recovered_ns as i64 - original_ns as i64).unsigned_abs() <= max_error,
+            "roundtrip error too large: {} → {} ticks → {} (max_error={})",
+            original_ns, ticks, recovered_ns, max_error
+        );
     }
 
     #[test]

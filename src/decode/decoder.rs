@@ -10,7 +10,7 @@
 use std::fs::File;
 use std::path::Path;
 
-use symphonia::core::audio::{AudioBuffer, AudioBufferRef, SampleBuffer, Signal, SignalSpec};
+use symphonia::core::audio::{AudioBuffer, AudioBufferRef, Signal, SignalSpec};
 use symphonia::core::codecs::{Decoder, DecoderOptions, CODEC_TYPE_NULL};
 use symphonia::core::errors::Error as SymphoniaError;
 use symphonia::core::formats::{FormatOptions, FormatReader, SeekMode, SeekTo};
@@ -76,7 +76,6 @@ pub struct AudioDecoder {
     decoder: Box<dyn Decoder>,
     track_id: u32,
     info: AudioInfo,
-    sample_buffer: Option<SampleBuffer<f64>>,
     /// i32 样本缓冲区（整数直通路径）
     i32_buffer: Vec<i32>,
     spec: SignalSpec,
@@ -168,7 +167,6 @@ impl AudioDecoder {
             decoder,
             track_id,
             info,
-            sample_buffer: None,
             i32_buffer,
             spec,
         })
@@ -177,54 +175,6 @@ impl AudioDecoder {
     /// 获取音频信息
     pub fn info(&self) -> &AudioInfo {
         &self.info
-    }
-
-    /// 解码下一块数据
-    ///
-    /// 返回交错格式的 f64 样本
-    /// 返回空 Vec 表示文件结束
-    pub fn decode_next(&mut self) -> Result<Vec<f64>, DecodeError> {
-        loop {
-            // 读取下一个 packet
-            let packet = match self.reader.next_packet() {
-                Ok(p) => p,
-                Err(SymphoniaError::IoError(ref e))
-                    if e.kind() == std::io::ErrorKind::UnexpectedEof =>
-                {
-                    return Ok(Vec::new()); // EOF
-                }
-                Err(e) => return Err(DecodeError::DecodeFailed(e.to_string())),
-            };
-
-            // 跳过非目标轨道
-            if packet.track_id() != self.track_id {
-                continue;
-            }
-
-            // 解码
-            let decoded = match self.decoder.decode(&packet) {
-                Ok(d) => d,
-                Err(SymphoniaError::DecodeError(_)) => continue, // 跳过损坏的帧
-                Err(e) => return Err(DecodeError::DecodeFailed(e.to_string())),
-            };
-
-            // 转换为 f64 样本
-            let spec = *decoded.spec();
-            let duration = decoded.capacity();
-
-            // 确保 sample buffer 容量足够
-            if self.sample_buffer.is_none()
-                || self.sample_buffer.as_ref().unwrap().capacity() < duration
-            {
-                self.sample_buffer = Some(SampleBuffer::new(duration as u64, spec));
-                self.spec = spec;
-            }
-
-            let sample_buffer = self.sample_buffer.as_mut().unwrap();
-            sample_buffer.copy_interleaved_ref(decoded);
-
-            return Ok(sample_buffer.samples().to_vec());
-        }
     }
 
     /// 解码下一块数据（整数直通路径）
@@ -441,12 +391,12 @@ impl DoubleBuffer {
     }
 }
 
-/// 简单的解码器迭代器，用于流式解码
+/// 解码器迭代器，用于流式解码
+///
+/// 使用双缓冲避免 copy_within，减少热路径开销
 pub struct DecoderIterator {
     decoder: AudioDecoder,
-    buffer: Vec<f64>,
-    position: usize,
-    /// 双缓冲（整数直通路径）- 避免 copy_within
+    /// 双缓冲（i32 直通路径）
     double_buffer: DoubleBuffer,
 }
 
@@ -454,8 +404,6 @@ impl DecoderIterator {
     pub fn new(decoder: AudioDecoder) -> Self {
         Self {
             decoder,
-            buffer: Vec::new(),
-            position: 0,
             double_buffer: DoubleBuffer::new(),
         }
     }
@@ -465,37 +413,9 @@ impl DecoderIterator {
         &self.decoder
     }
 
-    /// 读取指定数量的样本
-    pub fn read(&mut self, count: usize) -> Result<Vec<f64>, DecodeError> {
-        let mut result = Vec::with_capacity(count);
-
-        while result.len() < count {
-            // 先从缓冲区读取
-            if self.position < self.buffer.len() {
-                let available = self.buffer.len() - self.position;
-                let to_copy = available.min(count - result.len());
-                result.extend_from_slice(&self.buffer[self.position..self.position + to_copy]);
-                self.position += to_copy;
-            } else {
-                // 解码更多数据
-                self.buffer = self.decoder.decode_next()?;
-                self.position = 0;
-
-                if self.buffer.is_empty() {
-                    break; // EOF
-                }
-            }
-        }
-
-        Ok(result)
-    }
-
-    /// 读取指定数量的 i32 样本（整数直通路径）
+    /// 读取指定数量的 i32 样本
     ///
-    /// 对于整数源格式，避免 f64 中间转换
     /// 返回的样本已左对齐到 i32 高位
-    ///
-    /// 使用双缓冲避免 copy_within，减少热路径开销
     pub fn read_i32(&mut self, count: usize) -> Result<&[i32], DecodeError> {
         // 如果当前缓冲区有足够数据，直接返回切片（零拷贝快速路径）
         if self.double_buffer.available() >= count {
@@ -530,8 +450,7 @@ impl DecoderIterator {
 
     /// 检查是否到达文件末尾
     pub fn is_eof(&self) -> bool {
-        self.position >= self.buffer.len() && self.buffer.is_empty()
-            && self.double_buffer.available() == 0
+        self.double_buffer.available() == 0
     }
 }
 
@@ -604,18 +523,9 @@ fn convert_s16_to_i32_stereo_neon(buf: &AudioBuffer<i16>, output: &mut [i32], fr
             let right_shifted = vshlq_n_s32(right_s32, 16);
 
             // 交织写入输出（L0, R0, L1, R1, L2, R2, L3, R3）
-            let out_idx = i * 2;
-            let l_arr: [i32; 4] = std::mem::transmute(left_shifted);
-            let r_arr: [i32; 4] = std::mem::transmute(right_shifted);
-
-            output[out_idx] = l_arr[0];
-            output[out_idx + 1] = r_arr[0];
-            output[out_idx + 2] = l_arr[1];
-            output[out_idx + 3] = r_arr[1];
-            output[out_idx + 4] = l_arr[2];
-            output[out_idx + 5] = r_arr[2];
-            output[out_idx + 6] = l_arr[3];
-            output[out_idx + 7] = r_arr[3];
+            // vst2q_s32 一条指令完成交织 + 存储，替代 8 次标量 store
+            let pair = int32x4x2_t(left_shifted, right_shifted);
+            vst2q_s32(output.as_mut_ptr().add(i * 2), pair);
         }
     }
 
@@ -694,19 +604,9 @@ fn convert_s24_to_i32_stereo_neon(
             let left_shifted = vshlq_n_s32(left_s32, 8);
             let right_shifted = vshlq_n_s32(right_s32, 8);
 
-            // 交织写入输出
-            let out_idx = i * 2;
-            let l_arr: [i32; 4] = std::mem::transmute(left_shifted);
-            let r_arr: [i32; 4] = std::mem::transmute(right_shifted);
-
-            output[out_idx] = l_arr[0];
-            output[out_idx + 1] = r_arr[0];
-            output[out_idx + 2] = l_arr[1];
-            output[out_idx + 3] = r_arr[1];
-            output[out_idx + 4] = l_arr[2];
-            output[out_idx + 5] = r_arr[2];
-            output[out_idx + 6] = l_arr[3];
-            output[out_idx + 7] = r_arr[3];
+            // 交织写入输出（L0, R0, L1, R1, L2, R2, L3, R3）
+            let pair = int32x4x2_t(left_shifted, right_shifted);
+            vst2q_s32(output.as_mut_ptr().add(i * 2), pair);
         }
     }
 

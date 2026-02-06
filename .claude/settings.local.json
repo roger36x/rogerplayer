@@ -17,7 +17,8 @@
       "Bash(chmod:*)",
       "Bash(/Users/bytedance/hifi/replayer/scripts/build-app.sh:*)",
       "Bash(rustup target add:*)",
-      "Bash(./scripts/build-app.sh:*)"
+      "Bash(./scripts/build-app.sh:*)",
+      "Bash(find:*)"
     ]
   }
 }
