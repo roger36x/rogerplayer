@@ -248,6 +248,17 @@ fn handle_key_event(app: &mut App, code: KeyCode) {
     }
 
     // 正常模式下的按键处理
+
+    // 数字键：累积 pending_count（vim 风格 {n}G 跳转）
+    if let KeyCode::Char(c @ '0'..='9') = code {
+        let digit = (c as usize) - ('0' as usize);
+        app.pending_count = Some(app.pending_count.unwrap_or(0) * 10 + digit);
+        return;
+    }
+
+    // 非数字键：消费或清除 pending_count
+    let count = app.pending_count.take();
+
     match code {
         KeyCode::Char('q') | KeyCode::Esc => {
             app.should_quit = true;
@@ -298,7 +309,14 @@ fn handle_key_event(app: &mut App, code: KeyCode) {
             if !app.playlist.is_empty() {
                 app.last_selection_time = Some(Instant::now());
                 app.show_cursor = true;
-                app.playlist_state.select(Some(app.playlist.len() - 1));
+                let target = if let Some(n) = count {
+                    // {n}G: 跳转到第 n 行（1-based，clamp 到有效范围）
+                    (n.saturating_sub(1)).min(app.playlist.len() - 1)
+                } else {
+                    // G: 跳转到最后一行
+                    app.playlist.len() - 1
+                };
+                app.playlist_state.select(Some(target));
             }
         }
         KeyCode::Enter => {

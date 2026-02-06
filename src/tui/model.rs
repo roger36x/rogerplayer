@@ -106,6 +106,9 @@ pub struct App {
 
     /// 是否显示帮助页面
     pub show_help: bool,
+
+    /// Vim 风格数字前缀（用于 {n}G 跳转）
+    pub pending_count: Option<usize>,
 }
 
 /// 切歌防抖间隔（毫秒）
@@ -150,6 +153,7 @@ impl App {
             search_results: Vec::new(),
             search_result_index: 0,
             show_help: false,
+            pending_count: None,
         }
     }
 
