@@ -4,7 +4,7 @@
 //! 核心设计：解码线程和输出回调完全解耦，通过 lock-free ring buffer 连接
 
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
@@ -100,8 +100,6 @@ struct DecoderState {
     paused: AtomicBool,
     /// 解码是否已到达 EOF
     eof_reached: AtomicBool,
-    /// 已解码样本数
-    samples_decoded: AtomicU64,
 }
 
 /// 播放引擎
@@ -128,7 +126,6 @@ impl Engine {
             running: AtomicBool::new(false),
             paused: AtomicBool::new(false),
             eof_reached: AtomicBool::new(false),
-            samples_decoded: AtomicU64::new(0),
         });
 
         Self {
@@ -208,13 +205,9 @@ impl Engine {
         self.decoder_state.running.store(true, Ordering::Release);
         self.decoder_state.paused.store(false, Ordering::Release);
         self.decoder_state.eof_reached.store(false, Ordering::Release);
-        self.decoder_state
-            .samples_decoded
-            .store(0, Ordering::Release);
 
         let decoder_state = Arc::clone(&self.decoder_state);
         let ring_buffer = Arc::clone(&self.ring_buffer);
-        let prebuffer_ratio = self.config.prebuffer_ratio;
         let channels = info.channels as usize;
         let sample_rate = source_sample_rate;
         let buffer_frames = self.config.output.buffer_frames;
@@ -226,7 +219,6 @@ impl Engine {
                     decoder,
                     ring_buffer,
                     decoder_state,
-                    prebuffer_ratio,
                     channels,
                     sample_rate,
                     buffer_frames,
@@ -251,7 +243,6 @@ impl Engine {
         decoder: AudioDecoder,
         ring_buffer: Arc<RingBuffer<i32>>,
         state: Arc<DecoderState>,
-        prebuffer_ratio: f64,
         channels: usize,
         sample_rate: u32,
         buffer_frames: u32,
@@ -260,10 +251,6 @@ impl Engine {
         Self::set_decoder_thread_priority(buffer_frames, sample_rate);
 
         let mut iter = DecoderIterator::new(decoder);
-
-        // 预缓冲目标
-        let prebuffer_samples = (ring_buffer.capacity() as f64 * prebuffer_ratio) as usize;
-        let mut prebuffered = false;
 
         // 读取块大小
         let read_chunk_size = 4096 * channels;
@@ -274,8 +261,7 @@ impl Engine {
         let min_free_threshold = 1024 * channels;
 
         log::info!(
-            "Decoder thread started, prebuffer target: {} samples, ~{}ns/sample",
-            prebuffer_samples,
+            "Decoder thread started, ~{}ns/sample",
             ns_per_sample
         );
 
@@ -332,17 +318,7 @@ impl Engine {
                     }
 
                     // 直接写入 ring buffer（SRC 由 CoreAudio 处理）
-                    let samples_written = ring_buffer.write(samples);
-
-                    state
-                        .samples_decoded
-                        .fetch_add(samples_written as u64, Ordering::Relaxed);
-
-                    // 检查预缓冲是否完成
-                    if !prebuffered && ring_buffer.available() >= prebuffer_samples {
-                        prebuffered = true;
-                        log::info!("Prebuffer complete");
-                    }
+                    ring_buffer.write(samples);
                 }
                 Err(e) => {
                     log::error!("Decode error: {}", e);

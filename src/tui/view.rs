@@ -57,8 +57,8 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
     }
     let modes_str = mode_tags.join(" ");
 
-    // 单行显示：Roger Player v0.1.0  (h: Help)    [SHUFFLE] [REPEAT:ALL]    [RUNNING]
-    let title = "Roger Player v0.1.0";
+    // 单行显示：Roger Player vX.Y.Z  (h: Help)    [SHUFFLE] [REPEAT:ALL]    [RUNNING]
+    let title = concat!("Roger Player v", env!("CARGO_PKG_VERSION"));
     let help_hint = "(h: Help)";
     let right_part = if modes_str.is_empty() {
         state_str.to_string()
