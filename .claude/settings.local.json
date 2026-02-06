@@ -18,7 +18,12 @@
       "Bash(/Users/bytedance/hifi/replayer/scripts/build-app.sh:*)",
       "Bash(rustup target add:*)",
       "Bash(./scripts/build-app.sh:*)",
-      "Bash(find:*)"
+      "Bash(find:*)",
+      "Bash(command -v:*)",
+      "Bash(qlmanage:*)",
+      "Read(//tmp/**)",
+      "Bash(./scripts/generate-icon.sh:*)",
+      "Bash(open:*)"
     ]
   }
 }

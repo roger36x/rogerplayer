@@ -1,7 +1,9 @@
 use std::ffi::OsStr;
 use std::path::PathBuf;
+use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
+use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
 use rand::seq::SliceRandom;
 
 use crate::audio::AudioOutput;
@@ -109,6 +111,16 @@ pub struct App {
 
     /// Vim 风格数字前缀（用于 {n}G 跳转）
     pub pending_count: Option<usize>,
+
+    /// 当前监听的目录路径（用于目录变化时刷新播放列表）
+    watched_dir: Option<PathBuf>,
+
+    /// 目录变化事件接收器
+    dir_watcher_rx: Option<Receiver<()>>,
+
+    /// 文件系统监听器（需要保持存活）
+    #[allow(dead_code)]
+    dir_watcher: Option<RecommendedWatcher>,
 }
 
 /// 切歌防抖间隔（毫秒）
@@ -154,6 +166,9 @@ impl App {
             search_result_index: 0,
             show_help: false,
             pending_count: None,
+            watched_dir: None,
+            dir_watcher_rx: None,
+            dir_watcher: None,
         }
     }
 
@@ -207,16 +222,18 @@ impl App {
     fn do_load_path(&mut self, path_str: &str) {
         let path = PathBuf::from(path_str);
 
-        let files = if path.is_dir() {
+        let (files, dir_to_watch) = if path.is_dir() {
             match Self::scan_audio_files(&path) {
-                Ok(f) => f,
+                Ok(f) => (f, Some(path.clone())),
                 Err(e) => {
                     self.log(format!("Error scanning directory: {}", e));
                     return;
                 }
             }
         } else if Self::is_audio_file(&path) {
-            vec![path]
+            // 单文件：监听其父目录
+            let parent = path.parent().map(|p| p.to_path_buf());
+            (vec![path], parent)
         } else {
             self.log(format!("Not a supported audio file: {}", path_str));
             return;
@@ -237,6 +254,11 @@ impl App {
             self.generate_shuffle_order();
         } else {
             self.shuffle_order = (0..self.playlist.len()).collect();
+        }
+
+        // 启动目录监听
+        if let Some(dir) = dir_to_watch {
+            self.start_watching(&dir);
         }
 
         // 自动播放第一首
@@ -634,5 +656,157 @@ impl App {
         self.search_input.clear();
         self.search_results.clear();
         self.search_result_index = 0;
+    }
+
+    // ========== 目录监听相关方法 ==========
+
+    /// 启动目录监听
+    fn start_watching(&mut self, dir: &PathBuf) {
+        // 停止之前的监听
+        self.stop_watching();
+
+        let (tx, rx) = mpsc::channel();
+        let dir_clone = dir.clone();
+
+        // 创建 watcher，使用默认配置
+        let watcher_result = RecommendedWatcher::new(
+            move |res: Result<notify::Event, notify::Error>| {
+                if let Ok(event) = res {
+                    // 只关心创建、删除、修改、重命名事件
+                    use notify::EventKind;
+                    match event.kind {
+                        EventKind::Create(_)
+                        | EventKind::Remove(_)
+                        | EventKind::Modify(notify::event::ModifyKind::Name(_)) => {
+                            // 发送通知（忽略发送失败，可能 receiver 已关闭）
+                            let _ = tx.send(());
+                        }
+                        _ => {}
+                    }
+                }
+            },
+            Config::default(),
+        );
+
+        match watcher_result {
+            Ok(mut watcher) => {
+                // 监听目录（非递归）
+                if let Err(e) = watcher.watch(&dir_clone, RecursiveMode::NonRecursive) {
+                    self.log(format!("Failed to watch directory: {}", e));
+                    return;
+                }
+
+                self.watched_dir = Some(dir.clone());
+                self.dir_watcher_rx = Some(rx);
+                self.dir_watcher = Some(watcher);
+                self.log(format!("Watching: {}", dir.display()));
+            }
+            Err(e) => {
+                self.log(format!("Failed to create watcher: {}", e));
+            }
+        }
+    }
+
+    /// 停止目录监听
+    fn stop_watching(&mut self) {
+        self.dir_watcher = None;
+        self.dir_watcher_rx = None;
+        self.watched_dir = None;
+    }
+
+    /// 检查目录是否有变化（从主循环调用）
+    ///
+    /// 返回 true 表示播放列表已更新，需要重绘
+    pub fn check_dir_changes(&mut self) -> bool {
+        // 检查是否有事件
+        let has_event = if let Some(rx) = &self.dir_watcher_rx {
+            // 非阻塞地消费所有待处理事件
+            let mut found = false;
+            while rx.try_recv().is_ok() {
+                found = true;
+            }
+            found
+        } else {
+            false
+        };
+
+        if has_event {
+            self.refresh_playlist();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// 刷新播放列表（保持当前播放位置）
+    fn refresh_playlist(&mut self) {
+        let Some(dir) = &self.watched_dir else {
+            return;
+        };
+
+        // 记住当前正在播放的文件路径
+        let current_path = if self.current_index < self.playlist.len() {
+            Some(self.playlist[self.current_index].clone())
+        } else {
+            None
+        };
+
+        // 重新扫描目录
+        let new_files = match Self::scan_audio_files(dir) {
+            Ok(f) => f,
+            Err(e) => {
+                self.log(format!("Error refreshing directory: {}", e));
+                return;
+            }
+        };
+
+        if new_files.is_empty() {
+            self.log("Directory is now empty".to_string());
+            self.playlist = new_files;
+            self.current_index = 0;
+            self.playlist_state.select(None);
+            return;
+        }
+
+        let old_len = self.playlist.len();
+        let new_len = new_files.len();
+
+        // 更新播放列表
+        self.playlist = new_files;
+
+        // 尝试恢复当前播放位置
+        if let Some(path) = current_path {
+            if let Some(new_idx) = self.playlist.iter().position(|p| p == &path) {
+                // 当前播放的文件仍存在，更新索引
+                self.current_index = new_idx;
+            }
+            // 如果文件已被删除，保持 current_index 不变（engine 仍在播放已打开的文件）
+            // 但需要 clamp 到有效范围
+            else if self.current_index >= self.playlist.len() {
+                self.current_index = self.playlist.len().saturating_sub(1);
+            }
+        }
+
+        // 更新 UI 选择状态
+        if !self.playlist.is_empty() {
+            let selected = self.playlist_state.selected().unwrap_or(0);
+            if selected >= self.playlist.len() {
+                self.playlist_state.select(Some(self.playlist.len() - 1));
+            }
+        } else {
+            self.playlist_state.select(None);
+        }
+
+        // 重新生成 shuffle 顺序
+        if self.shuffle {
+            self.generate_shuffle_order();
+        } else {
+            self.shuffle_order = (0..self.playlist.len()).collect();
+        }
+
+        // 仅当文件数量有变化时记录日志
+        if old_len != new_len {
+            self.log(format!("Playlist updated: {} files", new_len));
+        }
     }
 }

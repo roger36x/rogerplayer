@@ -112,6 +112,11 @@ pub fn run(mut app: App) -> io::Result<()> {
             needs_redraw = true;
         }
 
+        // === 目录变化检测（非阻塞检查 channel）===
+        if app.check_dir_changes() {
+            needs_redraw = true;
+        }
+
         // === 选曲光标超时检查（纯本地状态，无原子操作）===
         app.check_cursor_timeout();
 
