@@ -53,7 +53,19 @@ fi
 osascript <<APPLESCRIPT
 tell application "Terminal"
     activate
-    set newTab to do script "cd ~ && '$BINARY' tui $ARGS; exit"
+    do script "cd ~ && '$BINARY' tui $ARGS; exit"
+    set playerWindow to front window
+    repeat
+        delay 0.5
+        try
+            if not busy of playerWindow then
+                close playerWindow
+                exit repeat
+            end if
+        on error
+            exit repeat
+        end try
+    end repeat
 end tell
 APPLESCRIPT
 LAUNCHER_EOF
