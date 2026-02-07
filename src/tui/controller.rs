@@ -32,6 +32,12 @@ const DRAW_INTERVAL_IDLE_MS: u64 = 100;
 /// poll 本身是极轻量级 syscall（select/kqueue），不会影响音频
 const INPUT_POLL_MS: u64 = 50;
 
+/// IME 污染延迟清理间隔（秒）
+///
+/// 普通按键后延迟 10 秒再触发全量重绘，避免频繁闪烁。
+/// 退出搜索/输入模式时会立即触发，不受此延迟影响。
+const IME_CLEANUP_DELAY_SECS: u64 = 10;
+
 /// TUI 运行入口
 pub fn run(mut app: App) -> io::Result<()> {
     // =======================================================
@@ -73,7 +79,10 @@ pub fn run(mut app: App) -> io::Result<()> {
     // - 统计读取：仅在绘制前（减少对音频线程 cache line 的访问）
     let mut last_draw = Instant::now();
     let mut needs_redraw = true;
-    let mut needs_full_redraw = false;
+    // IME 污染修复状态
+    let mut needs_full_redraw = false;        // 下次绘制时是否全量重绘
+    let mut pending_delayed_redraw = false;   // 是否有待处理的延迟重绘
+    let mut last_key_time: Option<Instant> = None;  // 最后一次按键时间
 
     // 自动播放第一首
     if !app.playlist.is_empty() {
@@ -99,11 +108,37 @@ pub fn run(mut app: App) -> io::Result<()> {
         if crossterm::event::poll(poll_timeout)? {
             if let Event::Key(key) = event::read()? {
                 if key.kind == KeyEventKind::Press {
+                    // 记录按键前的模式状态
+                    let was_in_input_mode = app.search_mode || app.input_mode;
+
                     handle_key_event(&mut app, key.code);
                     needs_redraw = true;
-                    // IME 组合态会绕过 ratatui 直接写终端缓冲区，
-                    // 任何按键后都标记全量重绘以覆盖脏区域
+
+                    // 检查是否刚退出搜索/输入模式
+                    let now_in_input_mode = app.search_mode || app.input_mode;
+                    if was_in_input_mode && !now_in_input_mode {
+                        // 退出输入模式：立即触发全量重绘
+                        needs_full_redraw = true;
+                        pending_delayed_redraw = false;
+                    } else {
+                        // 普通按键：设置延迟重绘
+                        // IME 组合态可能绕过 ratatui 直接写终端缓冲区
+                        pending_delayed_redraw = true;
+                        last_key_time = Some(Instant::now());
+                    }
+                }
+            }
+        }
+
+        // === 延迟重绘检查 ===
+        // 10 秒无按键后触发全量重绘，清理可能的 IME 污染
+        if pending_delayed_redraw {
+            if let Some(key_time) = last_key_time {
+                if key_time.elapsed() >= Duration::from_secs(IME_CLEANUP_DELAY_SECS) {
                     needs_full_redraw = true;
+                    pending_delayed_redraw = false;
+                    last_key_time = None;
+                    needs_redraw = true;
                 }
             }
         }
@@ -130,14 +165,20 @@ pub fn run(mut app: App) -> io::Result<()> {
             || draw_elapsed >= draw_interval;
 
         if should_draw {
-            // IME 污染修复：输入模式下有按键则清空 ratatui 内部 buffer，
-            // 下次 draw 变成全量写入，覆盖 IME 留下的脏区域
-            if needs_full_redraw {
-                terminal.clear()?;
-                needs_full_redraw = false;
-            }
             // 仅在绘制前读取统计信息（减少 cache line 访问频率）
             app.update_stats();
+
+            // IME 污染修复：重置 ratatui 内部 buffer，强制全量写入
+            // - 不调用 terminal.clear()（会发送清屏指令导致黑屏闪烁）
+            // - 重置 previous buffer 使差分更新认为所有内容都需要重写
+            // - 全量写入会覆盖 IME 留下的脏区域
+            if needs_full_redraw {
+                // 重置 buffers：下次 draw 时变成全量写入
+                terminal.swap_buffers();
+                terminal.current_buffer_mut().reset();
+                needs_full_redraw = false;
+            }
+
             terminal.draw(|f| view::draw(f, &mut app))?;
             last_draw = Instant::now();
             needs_redraw = false;
