@@ -73,6 +73,7 @@ pub fn run(mut app: App) -> io::Result<()> {
     // - 统计读取：仅在绘制前（减少对音频线程 cache line 的访问）
     let mut last_draw = Instant::now();
     let mut needs_redraw = true;
+    let mut needs_full_redraw = false;
 
     // 自动播放第一首
     if !app.playlist.is_empty() {
@@ -100,6 +101,9 @@ pub fn run(mut app: App) -> io::Result<()> {
                 if key.kind == KeyEventKind::Press {
                     handle_key_event(&mut app, key.code);
                     needs_redraw = true;
+                    // IME 组合态会绕过 ratatui 直接写终端缓冲区，
+                    // 任何按键后都标记全量重绘以覆盖脏区域
+                    needs_full_redraw = true;
                 }
             }
         }
@@ -126,6 +130,12 @@ pub fn run(mut app: App) -> io::Result<()> {
             || draw_elapsed >= draw_interval;
 
         if should_draw {
+            // IME 污染修复：输入模式下有按键则清空 ratatui 内部 buffer，
+            // 下次 draw 变成全量写入，覆盖 IME 留下的脏区域
+            if needs_full_redraw {
+                terminal.clear()?;
+                needs_full_redraw = false;
+            }
             // 仅在绘制前读取统计信息（减少 cache line 访问频率）
             app.update_stats();
             terminal.draw(|f| view::draw(f, &mut app))?;
