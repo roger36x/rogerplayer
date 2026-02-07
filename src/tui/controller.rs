@@ -35,7 +35,7 @@ const INPUT_POLL_MS: u64 = 50;
 /// IME 污染延迟清理间隔（秒）
 ///
 /// 普通按键后延迟 10 秒再触发全量重绘，避免频繁闪烁。
-/// 退出搜索/输入模式时会立即触发，不受此延迟影响。
+/// 退出搜索模式时会立即触发，不受此延迟影响。
 const IME_CLEANUP_DELAY_SECS: u64 = 10;
 
 /// TUI 运行入口
@@ -109,15 +109,14 @@ pub fn run(mut app: App) -> io::Result<()> {
             if let Event::Key(key) = event::read()? {
                 if key.kind == KeyEventKind::Press {
                     // 记录按键前的模式状态
-                    let was_in_input_mode = app.search_mode || app.input_mode;
+                    let was_in_search_mode = app.search_mode;
 
                     handle_key_event(&mut app, key.code);
                     needs_redraw = true;
 
-                    // 检查是否刚退出搜索/输入模式
-                    let now_in_input_mode = app.search_mode || app.input_mode;
-                    if was_in_input_mode && !now_in_input_mode {
-                        // 退出输入模式：立即触发全量重绘
+                    // 检查是否刚退出搜索模式
+                    if was_in_search_mode && !app.search_mode {
+                        // 退出搜索模式：立即触发全量重绘
                         needs_full_redraw = true;
                         pending_delayed_redraw = false;
                     } else {
@@ -173,7 +172,6 @@ pub fn run(mut app: App) -> io::Result<()> {
             // - 重置 previous buffer 使差分更新认为所有内容都需要重写
             // - 全量写入会覆盖 IME 留下的脏区域
             if needs_full_redraw {
-                // 重置 buffers：下次 draw 时变成全量写入
                 terminal.swap_buffers();
                 terminal.current_buffer_mut().reset();
                 needs_full_redraw = false;
